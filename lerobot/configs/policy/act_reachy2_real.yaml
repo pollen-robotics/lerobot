@@ -16,7 +16,7 @@
 
 seed: 1000
 # dataset_repo_id: cadene/reachy2_teleop_remi
-dataset_repo_id: [pollen-robotics/reachy2_mobile_household_apple, pollen-robotics/reachy2_mobile_household_apple_TMP_TEST]
+dataset_repo_id: [pollen-robotics/grasp_mug, pollen-robotics/grasp_apple]
 
 override_dataset_stats:
   observation.images.cam_trunk:

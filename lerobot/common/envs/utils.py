@@ -27,10 +27,13 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
         Dictionary of observation batches with keys renamed to LeRobot format and values as tensors.
     """
     # map to expected inputs for the policy
-    return_observations = {}
+    out_observations = {}
 
     if isinstance(observations["pixels"], dict):
-        imgs = {f"observation.images.{key}": img for key, img in observations["pixels"].items()}
+        imgs = {
+            f"observation.images.{key}": img
+            for key, img in observations["pixels"].items()
+        }
     else:
         imgs = {"observation.image": observations["pixels"]}
 
@@ -49,10 +52,16 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
         img = img.type(torch.float32)
         img /= 255
 
-        return_observations[imgkey] = img
+        out_observations[imgkey] = img
 
     # TODO(rcadene): enable pixels only baseline with `obs_type="pixels"` in environment by removing
     # requirement for "agent_pos"
-    return_observations["observation.state"] = torch.from_numpy(observations["agent_pos"]).float()
+    out_observations["observation.state"] = torch.from_numpy(
+        observations["agent_pos"]
+    ).float()
+    if "dataset_index" in observations:
+        out_observations["dataset_index"] = torch.from_numpy(
+            observations["dataset_index"]
+        )
 
-    return return_observations
+    return out_observations

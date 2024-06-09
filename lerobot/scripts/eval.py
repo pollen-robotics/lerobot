@@ -73,7 +73,12 @@ from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import Policy
 from lerobot.common.policies.utils import get_device_from_parameters
 from lerobot.common.utils.io_utils import write_video
-from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
+from lerobot.common.utils.utils import (
+    get_safe_torch_device,
+    init_hydra_config,
+    init_logging,
+    set_global_seed,
+)
 
 
 def rollout(
@@ -147,7 +152,9 @@ def rollout(
         if return_observations:
             all_observations.append(deepcopy(observation))
 
-        observation = {key: observation[key].to(device, non_blocking=True) for key in observation}
+        observation = {
+            key: observation[key].to(device, non_blocking=True) for key in observation
+        }
 
         with torch.inference_mode():
             action = policy.select_action(observation)
@@ -164,7 +171,10 @@ def rollout(
         # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
         # available of none of the envs finished.
         if "final_info" in info:
-            successes = [info["is_success"] if info is not None else False for info in info["final_info"]]
+            successes = [
+                info["is_success"] if info is not None else False
+                for info in info["final_info"]
+            ]
         else:
             successes = [False] * env.num_envs
 
@@ -178,9 +188,13 @@ def rollout(
 
         step += 1
         running_success_rate = (
-            einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
+            einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any")
+            .numpy()
+            .mean()
         )
-        progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
+        progbar.set_postfix(
+            {"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"}
+        )
         progbar.update()
 
     # Track the final observation.
@@ -198,7 +212,9 @@ def rollout(
     if return_observations:
         stacked_observations = {}
         for key in all_observations[0]:
-            stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
+            stacked_observations[key] = torch.stack(
+                [obs[key] for obs in all_observations], dim=1
+            )
         ret["observation"] = stacked_observations
 
     return ret
@@ -253,7 +269,9 @@ def eval_policy(
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            ep_frames.append(
+                np.stack([env.envs[i].render() for i in range(n_to_render_now)])
+            )  # noqa: B023
         elif isinstance(env, gym.vector.AsyncVectorEnv):
             # Here we must render all frames and discard any we don't need.
             ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
@@ -264,14 +282,19 @@ def eval_policy(
     if return_episode_data:
         episode_data: dict | None = None
 
-    progbar = trange(n_batches, desc="Stepping through eval batches", disable=not enable_progbar)
+    progbar = trange(
+        n_batches, desc="Stepping through eval batches", disable=not enable_progbar
+    )
     for batch_ix in progbar:
         # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
         # step.
         if max_episodes_rendered > 0:
             ep_frames: list[np.ndarray] = []
 
-        seeds = range(start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs))
+        seeds = range(
+            start_seed + (batch_ix * env.num_envs),
+            start_seed + ((batch_ix + 1) * env.num_envs),
+        )
         rollout_data = rollout(
             env,
             policy,
@@ -285,16 +308,27 @@ def eval_policy(
         # this won't be included).
         n_steps = rollout_data["done"].shape[1]
         # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
-        done_indices = torch.argmax(rollout_data["done"].to(int), axis=1)  # (batch_size, rollout_steps)
+        done_indices = torch.argmax(
+            rollout_data["done"].to(int), axis=1
+        )  # (batch_size, rollout_steps)
         # Make a mask with shape (batch, n_steps) to mask out rollout data after the first done
         # (batch-element-wise). Note the `done_indices + 1` to make sure to keep the data from the done step.
-        mask = (torch.arange(n_steps) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
+        mask = (
+            torch.arange(n_steps)
+            <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)
+        ).int()
         # Extend metrics.
-        batch_sum_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "sum")
+        batch_sum_rewards = einops.reduce(
+            (rollout_data["reward"] * mask), "b n -> b", "sum"
+        )
         sum_rewards.extend(batch_sum_rewards.tolist())
-        batch_max_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "max")
+        batch_max_rewards = einops.reduce(
+            (rollout_data["reward"] * mask), "b n -> b", "max"
+        )
         max_rewards.extend(batch_max_rewards.tolist())
-        batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
+        batch_successes = einops.reduce(
+            (rollout_data["success"] * mask), "b n -> b", "any"
+        )
         all_successes.extend(batch_successes.tolist())
         all_seeds.extend(seeds)
 
@@ -304,7 +338,9 @@ def eval_policy(
                 done_indices,
                 start_episode_index=batch_ix * env.num_envs,
                 start_data_index=(
-                    0 if episode_data is None else (episode_data["episode_data_index"]["to"][-1].item())
+                    0
+                    if episode_data is None
+                    else (episode_data["episode_data_index"]["to"][-1].item())
                 ),
                 fps=env.unwrapped.metadata["render_fps"],
             )
@@ -317,7 +353,8 @@ def eval_policy(
                     == this_episode_data["hf_dataset"]["episode_index"][0]
                 )
                 assert (
-                    episode_data["hf_dataset"]["index"][-1] + 1 == this_episode_data["hf_dataset"]["index"][0]
+                    episode_data["hf_dataset"]["index"][-1] + 1
+                    == this_episode_data["hf_dataset"]["index"][0]
                 )
                 assert torch.equal(
                     episode_data["episode_data_index"]["to"][-1],
@@ -354,7 +391,9 @@ def eval_policy(
                     target=write_video,
                     args=(
                         str(video_path),
-                        stacked_frames[: done_index + 1],  # + 1 to capture the last observation
+                        stacked_frames[
+                            : done_index + 1
+                        ],  # + 1 to capture the last observation
                         env.unwrapped.metadata["render_fps"],
                     ),
                 )
@@ -363,7 +402,9 @@ def eval_policy(
                 n_episodes_rendered += 1
 
         progbar.set_postfix(
-            {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
+            {
+                "running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"
+            }
         )
 
     # Wait till all video rendering threads are done.
@@ -409,7 +450,11 @@ def eval_policy(
 
 
 def _compile_episode_data(
-    rollout_data: dict, done_indices: Tensor, start_episode_index: int, start_data_index: int, fps: float
+    rollout_data: dict,
+    done_indices: Tensor,
+    start_episode_index: int,
+    start_data_index: int,
+    fps: float,
 ) -> dict:
     """Convenience function for `eval_policy(return_episode_data=True)`
 
@@ -422,7 +467,9 @@ def _compile_episode_data(
     total_frames = 0
     data_index_from = start_data_index
     for ep_ix in range(rollout_data["action"].shape[0]):
-        num_frames = done_indices[ep_ix].item() + 1  # + 1 to include the first done frame
+        num_frames = (
+            done_indices[ep_ix].item() + 1
+        )  # + 1 to include the first done frame
         total_frames += num_frames
 
         # TODO(rcadene): We need to add a missing last frame which is the observation
@@ -433,7 +480,9 @@ def _compile_episode_data(
             "frame_index": torch.arange(0, num_frames, 1),
             "timestamp": torch.arange(0, num_frames, 1) / fps,
             "next.done": rollout_data["done"][ep_ix, :num_frames],
-            "next.reward": rollout_data["reward"][ep_ix, :num_frames].type(torch.float32),
+            "next.reward": rollout_data["reward"][ep_ix, :num_frames].type(
+                torch.float32
+            ),
         }
         for key in rollout_data["observation"]:
             ep_dict[key] = rollout_data["observation"][key][ep_ix][:num_frames]
@@ -455,12 +504,20 @@ def _compile_episode_data(
                 for img in ep_dict[key]:
                     # sanity check that images are channel first
                     c, h, w = img.shape
-                    assert c < h and c < w, f"expect channel first images, but instead {img.shape}"
+                    assert (
+                        c < h and c < w
+                    ), f"expect channel first images, but instead {img.shape}"
 
                     # sanity check that images are float32 in range [0,1]
-                    assert img.dtype == torch.float32, f"expect torch.float32, but instead {img.dtype=}"
-                    assert img.max() <= 1, f"expect pixels lower than 1, but instead {img.max()=}"
-                    assert img.min() >= 0, f"expect pixels greater than 1, but instead {img.min()=}"
+                    assert (
+                        img.dtype == torch.float32
+                    ), f"expect torch.float32, but instead {img.dtype=}"
+                    assert (
+                        img.max() <= 1
+                    ), f"expect pixels lower than 1, but instead {img.max()=}"
+                    assert (
+                        img.min() >= 0
+                    ), f"expect pixels greater than 1, but instead {img.min()=}"
 
                     # from float32 in range [0,1] to uint8 in range [0,255]
                     img *= 255
@@ -471,7 +528,9 @@ def _compile_episode_data(
 
                     data_dict[key].append(img)
 
-    data_dict["index"] = torch.arange(start_data_index, start_data_index + total_frames, 1)
+    data_dict["index"] = torch.arange(
+        start_data_index, start_data_index + total_frames, 1
+    )
     episode_data_index["from"] = torch.tensor(episode_data_index["from"])
     episode_data_index["to"] = torch.tensor(episode_data_index["to"])
 
@@ -481,10 +540,15 @@ def _compile_episode_data(
         if "image" in key:
             features[key] = Image()
         else:
-            features[key] = Sequence(length=data_dict[key].shape[1], feature=Value(dtype="float32", id=None))
+            features[key] = Sequence(
+                length=data_dict[key].shape[1], feature=Value(dtype="float32", id=None)
+            )
     features.update(
         {
-            "action": Sequence(length=data_dict["action"].shape[1], feature=Value(dtype="float32", id=None)),
+            "action": Sequence(
+                length=data_dict["action"].shape[1],
+                feature=Value(dtype="float32", id=None),
+            ),
             "episode_index": Value(dtype="int64", id=None),
             "frame_index": Value(dtype="int64", id=None),
             "timestamp": Value(dtype="float32", id=None),
@@ -510,12 +574,12 @@ def eval(
 ):
     assert (pretrained_policy_path is None) ^ (hydra_cfg_path is None)
     if hydra_cfg_path is None:
-        hydra_cfg = init_hydra_config(pretrained_policy_path / "config.yaml", config_overrides)
+        hydra_cfg = init_hydra_config(
+            pretrained_policy_path / "config.yaml", config_overrides
+        )
     else:
         hydra_cfg = init_hydra_config(hydra_cfg_path, config_overrides)
-    out_dir = (
-        f"outputs/eval/{dt.now().strftime('%Y-%m-%d/%H-%M-%S')}_{hydra_cfg.env.name}_{hydra_cfg.policy.name}"
-    )
+    out_dir = f"outputs/eval/{dt.now().strftime('%Y-%m-%d/%H-%M-%S')}_{hydra_cfg.env.name}_{hydra_cfg.policy.name}"
 
     if out_dir is None:
         raise NotImplementedError()
@@ -534,13 +598,19 @@ def eval(
 
     logging.info("Making policy.")
     if hydra_cfg_path is None:
-        policy = make_policy(hydra_cfg=hydra_cfg, pretrained_policy_name_or_path=pretrained_policy_path)
+        policy = make_policy(
+            hydra_cfg=hydra_cfg, pretrained_policy_name_or_path=pretrained_policy_path
+        )
     else:
         # Note: We need the dataset stats to pass to the policy's normalization modules.
-        policy = make_policy(hydra_cfg=hydra_cfg, dataset_stats=make_dataset(hydra_cfg).stats)
+        policy = make_policy(
+            hydra_cfg=hydra_cfg, dataset_stats=make_dataset(hydra_cfg).stats
+        )
     policy.eval()
 
-    with torch.no_grad(), torch.autocast(device_type=device.type) if hydra_cfg.use_amp else nullcontext():
+    with torch.no_grad(), (
+        torch.autocast(device_type=device.type) if hydra_cfg.use_amp else nullcontext()
+    ):
         info = eval_policy(
             env,
             policy,
@@ -585,7 +655,9 @@ if __name__ == "__main__":
             "debugging). This argument is mutually exclusive with `--pretrained-policy-name-or-path` (`-p`)."
         ),
     )
-    parser.add_argument("--revision", help="Optionally provide the Hugging Face Hub revision ID.")
+    parser.add_argument(
+        "--revision", help="Optionally provide the Hugging Face Hub revision ID."
+    )
     parser.add_argument(
         "overrides",
         nargs="*",
@@ -598,17 +670,15 @@ if __name__ == "__main__":
     else:
         try:
             pretrained_policy_path = Path(
-                snapshot_download(args.pretrained_policy_name_or_path, revision=args.revision)
+                snapshot_download(
+                    args.pretrained_policy_name_or_path, revision=args.revision
+                )
             )
         except (HFValidationError, RepositoryNotFoundError) as e:
             if isinstance(e, HFValidationError):
-                error_message = (
-                    "The provided pretrained_policy_name_or_path is not a valid Hugging Face Hub repo ID."
-                )
+                error_message = "The provided pretrained_policy_name_or_path is not a valid Hugging Face Hub repo ID."
             else:
-                error_message = (
-                    "The provided pretrained_policy_name_or_path was not found on the Hugging Face Hub."
-                )
+                error_message = "The provided pretrained_policy_name_or_path was not found on the Hugging Face Hub."
 
             logging.warning(f"{error_message} Treating it as a local directory.")
             pretrained_policy_path = Path(args.pretrained_policy_name_or_path)
@@ -618,4 +688,7 @@ if __name__ == "__main__":
                 "repo ID, nor is it an existing local directory."
             )
 
-        eval(pretrained_policy_path=pretrained_policy_path, config_overrides=args.overrides)
+        eval(
+            pretrained_policy_path=pretrained_policy_path,
+            config_overrides=args.overrides,
+        )
