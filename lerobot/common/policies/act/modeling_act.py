@@ -88,7 +88,7 @@ class ACTPolicy(nn.Module, PyTorchModelHubMixin):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
-    @torch.no_grad
+    @torch.no_grad  # type: ignore
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:  #  type: ignore
         """Select a single action given environment observations.
 
@@ -293,11 +293,14 @@ class ACT(nn.Module):
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
         # (apirrone) I don't understand what I am doing here
-        self.dataset_index_embed = nn.Embedding(
+        # self.dataset_index_embed = nn.Embedding(
+        #     num_embeddings=2, embedding_dim=config.dim_model
+        # )
+        # (apirrone) and here too
+        # num_embeddings is the number of datasets used for training (?)
+        self.dataset_index_pos_embed = nn.Embedding(
             num_embeddings=2, embedding_dim=config.dim_model
         )
-        # (apirrone) and here too
-        self.dataset_index_pos_embed = nn.Embedding(1, config.dim_model)
 
         # Final action regression head on the output of the transformer's decoder.
         self.action_head = nn.Linear(
@@ -336,6 +339,7 @@ class ACT(nn.Module):
             ), "actions must be provided when using the variational objective in training mode."
 
         batch_size = batch["observation.images"].shape[0]
+        batch["dataset_index"] = batch["dataset_index"].unsqueeze(-1)
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and "action" in batch:
@@ -414,11 +418,12 @@ class ACT(nn.Module):
                 batch["observation.state"]
             )  # (B, C)
         latent_embed = self.encoder_latent_input_proj(latent_sample)  # (B, C)
-
         assert batch["dataset_index"].ndim == 2
         assert batch["dataset_index"].shape[0] == batch_size
         assert batch["dataset_index"].shape[1] == 1
-        dataset_index_embed = self.dataset_index_embed(batch["dataset_index"]).squeeze(
+        dataset_index_embed = self.dataset_index_pos_embed(
+            batch["dataset_index"]
+        ).squeeze(
             1
         )  # (B, C)
 
@@ -435,6 +440,7 @@ class ACT(nn.Module):
                 einops.rearrange(encoder_in, "b c h w -> (h w) b c"),
             ]
         )
+
         pos_embed = torch.cat(
             [
                 self.encoder_robot_and_latent_pos_embed.weight.unsqueeze(1),
@@ -444,6 +450,8 @@ class ACT(nn.Module):
             axis=0,
         )  # type: ignore
 
+        print("encoder in", encoder_in.shape)
+        print("pos embed", pos_embed.shape)
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in, pos_embed=pos_embed)
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
@@ -508,6 +516,7 @@ class ACTEncoderLayer(nn.Module):
         skip = x
         if self.pre_norm:
             x = self.norm1(x)
+
         q = k = x if pos_embed is None else x + pos_embed
         x = self.self_attn(q, k, value=x)[
             0
