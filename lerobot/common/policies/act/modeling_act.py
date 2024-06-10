@@ -415,7 +415,12 @@ class ACT(nn.Module):
             )  # (B, C)
         latent_embed = self.encoder_latent_input_proj(latent_sample)  # (B, C)
 
-        dataset_index_embed = self.dataset_index_embed(batch["dataset_index"])  # (B, C)
+        assert batch["dataset_index"].ndim == 2
+        assert batch["dataset_index"].shape[0] == batch_size
+        assert batch["dataset_index"].shape[1] == 1
+        dataset_index_embed = self.dataset_index_embed(batch["dataset_index"]).squeeze(
+            1
+        )  # (B, C)
 
         # Stack encoder input and positional embeddings moving to (S, B, C).
         encoder_in_feats = (
