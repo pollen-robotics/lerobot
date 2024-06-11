@@ -30,7 +30,10 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     return_observations = {}
 
     if isinstance(observations["pixels"], dict):
-        imgs = {f"observation.images.{key}": img for key, img in observations["pixels"].items()}
+        imgs = {
+            f"observation.images.{key}": img
+            for key, img in observations["pixels"].items()
+        }
     else:
         imgs = {"observation.image": observations["pixels"]}
 
@@ -53,6 +56,11 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
 
     # TODO(rcadene): enable pixels only baseline with `obs_type="pixels"` in environment by removing
     # requirement for "agent_pos"
-    return_observations["observation.state"] = torch.from_numpy(observations["agent_pos"]).float()
+    return_observations["observation.state"] = torch.from_numpy(
+        observations["agent_pos"]
+    ).float()
+    return_observations["dataset_index"] = torch.from_numpy(
+        observations["dataset_index"]
+    ).int()
 
     return return_observations

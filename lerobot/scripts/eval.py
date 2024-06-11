@@ -56,7 +56,8 @@ import einops
 import gymnasium as gym
 import numpy as np
 import torch
-from datasets import Dataset, Features, Image, Sequence, Value, concatenate_datasets
+from datasets import (Dataset, Features, Image, Sequence, Value,
+                      concatenate_datasets)
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils._errors import RepositoryNotFoundError
 from huggingface_hub.utils._validators import HFValidationError
@@ -73,7 +74,9 @@ from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import Policy
 from lerobot.common.policies.utils import get_device_from_parameters
 from lerobot.common.utils.io_utils import write_video
-from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
+from lerobot.common.utils.utils import (get_safe_torch_device,
+                                        init_hydra_config, init_logging,
+                                        set_global_seed)
 
 
 def rollout(
@@ -122,6 +125,7 @@ def rollout(
     policy.reset()
 
     observation, info = env.reset(seed=seeds)
+
     if render_callback is not None:
         render_callback(env)
 
