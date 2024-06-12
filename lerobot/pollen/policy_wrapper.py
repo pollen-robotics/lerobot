@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 import torch
 from gymnasium.envs.registration import register
 from huggingface_hub import snapshot_download
@@ -11,12 +12,16 @@ from huggingface_hub.utils._validators import HFValidationError
 from pollen_vision.camera_wrappers import CameraWrapper
 from pollen_vision.camera_wrappers.depthai import SDKWrapper
 from pollen_vision.camera_wrappers.depthai.utils import get_config_file_path
+
+# from pollen_vision.perception import Perception
 from reachy2_sdk import ReachySDK
 
 from lerobot.common.envs.utils import preprocess_observation
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import init_hydra_config
 from lerobot.pollen.reachy2_env import Reachy2Env
+
+FPS = 30
 
 
 class PolicyWrapper:
@@ -95,7 +100,7 @@ class PolicyWrapper:
             entry_point="lerobot.pollen.reachy2_env:Reachy2Env",
         )
         env_cls = gym.vector.SyncVectorEnv
-        gym_kwgs = {"fps": 30, "cam": self.cam, "reachy": self.reachy}
+        gym_kwgs = {"fps": FPS, "cam": self.cam, "reachy": self.reachy}
         self.env = env_cls(
             [
                 lambda: gym.make("reachy2_env", disable_env_checker=True, **gym_kwgs)
@@ -105,13 +110,27 @@ class PolicyWrapper:
 
 
 if __name__ == "__main__":
-    cam = SDKWrapper(get_config_file_path("CONFIG_SR"))
-    reachy = ReachySDK("192.168.1.42")
+    cam = SDKWrapper(get_config_file_path("CONFIG_SR"), fps=FPS, compute_depth=True)
+    # reachy = ReachySDK("192.168.1.42")
+    reachy = ReachySDK("localhost")
     pw = PolicyWrapper(
         pretrained_policy_name_or_path="pollen-robotics/grasp_mug_80K",
         cam=cam,
         reachy=reachy,
     )
+    # perception = Perception(cam, np.eye(4))
+    # perception.set_tracked_objects(["mug"])
+    # perception.start(visualize=True)
+
+    times = []
+    buffer_size = 100
     while True:
+        # objs = perception.get_objects_infos()
+        # print(objs)
+        start = time.time()
         pw.infer()
-        time.sleep(1 / 30)
+        took = time.time() - start
+        times.append(took)
+        times = times[-buffer_size:]
+        print("avg fps:", 1 / (sum(times) / len(times)))
+        time.sleep(max(0, 1 / FPS - took))
