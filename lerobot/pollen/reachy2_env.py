@@ -97,7 +97,19 @@ class Reachy2Env(gym.Env):
         self._get_obs()
         return self._observation, {}
 
+    def goto_action(self, action):
+        l_joints = action[0:7]
+        for i in range(len(l_joints)):
+            l_joints[i] = np.rad2deg(l_joints[i])
+        r_joints = action[8:15]
+        for i in range(len(r_joints)):
+            r_joints[i] = np.rad2deg(r_joints[i])
+        self.reachy.r_arm.goto_joints(r_joints, duration=1 / self.fps)
+        self.reachy.l_arm.goto_joints(l_joints, duration=1 / self.fps)
+
     def step(self, action):
+
+        # self.goto_action(action.copy())
 
         self.reachy.l_arm.shoulder.pitch.goal_position = np.rad2deg(action[0])
         self.reachy.l_arm.shoulder.roll.goal_position = np.rad2deg(action[1])
