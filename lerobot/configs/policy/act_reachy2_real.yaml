@@ -15,7 +15,7 @@
 # ```
 
 seed: 1000
-dataset_repo_id: pollen-robotics/grasp_mug
+dataset_repo_id: [pollen-robotics/grasp_mug_with_time, pollen-robotics/grasp_mug2_with_time]
 # dataset_repo_id: pollen-robotics/grasp_apple
 
 override_dataset_stats:

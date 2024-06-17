@@ -47,7 +47,7 @@ time.sleep(1)
 
 
 pw = PolicyWrapper(
-    pretrained_policy_name_or_path="pollen-robotics/grasp_mug_with_time_80K",
+    pretrained_policy_name_or_path="pollen-robotics/grasp_mug2_with_time_80K",
     cam=cam,
     reachy=reachy,
 )

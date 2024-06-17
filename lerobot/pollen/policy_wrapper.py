@@ -1,4 +1,3 @@
-import pickle
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -146,21 +145,16 @@ if __name__ == "__main__":
     reachy = ReachySDK("192.168.1.42")
     # reachy = ReachySDK("localhost")
     pw = PolicyWrapper(
-        pretrained_policy_name_or_path="pollen-robotics/grasp_mug_with_time_80K",
+        pretrained_policy_name_or_path="pollen-robotics/grasp_mug2_with_time_80K",
         cam=cam,
         reachy=reachy,
     )
-    actions = []
     try:
         while True:
             start = time.time()
-            _, action = pw.infer()
+            pw.infer()
             took = time.time() - start
-            actions.append(action)
 
             time.sleep(max(0, 1 / FPS - took))
     except KeyboardInterrupt:
-        print("Saving actions")
-        with open("actions.pkl", "wb") as f:
-            pickle.dump(actions, f)
         exit()
