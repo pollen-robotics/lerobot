@@ -5,23 +5,22 @@
 # With poetry: `poetry install --sync --extras "reachy2"`
 
 
-_target_: lerobot.common.robot_devices.robots.reachy2.ReachyRobotManipulatorconfig
+_target_: lerobot.common.robot_devices.robots.reachy2_manipulator.ReachyManipulatorRobot
 robot_type: reachy2
+calibration_dir: .cache/calibration/so100
 
 
-leader_arm:
-  main:
-    _target_: lerobot.common.robot_devices.motors.feetech.FeetechMotorsBus
-    port: /dev/tty.usbmodem585A0077581
-    calibration_dir: .cache/calibration/so100
-    motors:
-      # name: (index, model)
-      shoulder_pan: [1, "sts3215"]
-      shoulder_lift: [2, "sts3215"]
-      elbow_flex: [3, "sts3215"]
-      wrist_flex: [4, "sts3215"]
-      wrist_roll: [5, "sts3215"]
-      gripper: [6, "sts3215"]
+# leader_arm:
+#   _target_: lerobot.common.robot_devices.motors.feetech.FeetechMotorsBus
+#   port: /dev/ttyACM0
+#   motors:
+#     # name: (index, model)
+#     shoulder_pan: [1, "sts3215"]
+#     shoulder_lift: [2, "sts3215"]
+#     elbow_flex: [3, "sts3215"]
+#     wrist_flex: [4, "sts3215"]
+#     wrist_roll: [5, "sts3215"]
+#     gripper: [6, "sts3215"]
 
 cameras:
   head_left:

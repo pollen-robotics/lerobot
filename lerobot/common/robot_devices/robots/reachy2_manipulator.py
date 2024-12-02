@@ -24,6 +24,10 @@ import torch
 from lerobot.common.robot_devices.cameras.reachy2 import ReachyCamera
 from lerobot.common.robot_devices.motors.feetech import FeetechMotorsBus
 from reachy2_sdk import ReachySDK
+from lerobot.common.utils.kinematics import RobotKinematics
+from scipy.spatial.transform import Rotation as R
+from FramesViewer.viewer import Viewer
+import FramesViewer.utils as fv_utils
 
 REACHY_MOTORS = [
     "neck_yaw.pos",
@@ -54,18 +58,21 @@ REACHY_MOTORS = [
 @dataclass
 class ReachyManipulatorRobotConfig:
     robot_type: str | None = "reachy2"
-    cameras: dict[str, ReachyCamera] = field(default_factory=lambda: {})
-    ip_address: str | None = "172.17.135.207"
+    calibration_dir: str | None = None
+    # ip_address: str | None = "172.17.135.207"
     # ip_address: str | None = "192.168.0.197"
+    # leader_arm: FeetechMotorsBus | None = None
+    cameras: dict[str, ReachyCamera] = field(default_factory=lambda: {})
     # ip_address: str | None = "localhost"
+    ip_address: str | None = "172.17.134.85"
 
 
 class ReachyManipulatorRobot:
     """Wrapper of ReachySDK"""
 
-    def __init__(self, config: ReachyRobotManipulatorConfig | None = None, **kwargs):
+    def __init__(self, config: ReachyManipulatorRobotConfig | None = None, **kwargs):
         if config is None:
-            config = ReachyRobotManipulatorConfig()
+            config = ReachyManipulatorRobotConfig()
 
         # Overwrite config arguments using kwargs
         self.config = replace(config, **kwargs)
@@ -77,14 +84,29 @@ class ReachyManipulatorRobot:
         self.is_connected = False
         self.teleop = None
         self.logs = {}
-        self.reachy = None
+        self.reachy: ReachySDK = None
         self.mobile_base_available = False
 
         self.state_keys = None
         self.action_keys = None
+        # print(config.leader_arm)
+        # exit()
+        self.leader_arm = FeetechMotorsBus("/dev/ttyACM0", 
+            {
+                "shoulder_pan": [1, "sts3215"],
+                "shoulder_lift": [2, "sts3215"],
+                "elbow_flex": [3, "sts3215"],
+                "wrist_flex": [4, "sts3215"],
+                "wrist_roll": [5, "sts3215"],
+                "gripper": [6, "sts3215"],
+            }
+        )
+        # self.leader_calib_dir=config.calibration_dir
+        self.fv = Viewer()
+        self.fv.start()
+        self.initialized = False
 
-        self.leader_arm = FeetechMotorsBus(config.leader_arm.port, config.leader_arm.motors)
-        self.leader_calib_dir=config.leader_arm.calibration_dir
+        # self.kinematics = RobotKinematics()
 
     @property
     def camera_features(self) -> dict:
@@ -124,7 +146,7 @@ class ReachyManipulatorRobot:
         self.reachy = ReachySDK(host=self.config.ip_address)
         print("Connecting to Reachy")
         self.reachy.connect()
-        self.is_connected = self.reachy.is_connected
+        self.is_connected = self.reachy.is_connected()
         if not self.is_connected:
             print(
                 f"Cannot connect to Reachy at address {self.config.ip_address}. Maybe a connection already exists."
@@ -147,10 +169,10 @@ class ReachyManipulatorRobot:
         print("Connecting to leader arm")
         self.leader_arm.connect()
 
-        with open(self.leader_arm.calibration_dir) as f:
-            self.leader_arm.calibration = json.load(f)
-            self.leader_arm.set_calibration(self.leader_arm.calibration)
-            self.leader_arm.apply_calibration()
+        with open(self.config.calibration_dir + "/main_leader.json" ) as f:
+            self.calibration = json.load(f)
+            self.leader_arm.set_calibration(self.calibration)
+            # self.leader_arm.apply_calibration()
 
     def run_calibration(self):
         pass
@@ -163,12 +185,45 @@ class ReachyManipulatorRobot:
 
 
         #get leader arm
-       leader_pos = {}
-       for name in self.leader_arm:
-           before_lread_t = time.perf_counter()
-           leader_pos[name] = self.leader_arm[name].read("Present_Position")
-           leader_pos[name] = torch.from_numpy(leader_pos[name])
-           self.logs[f"read_leader_{name}_pos_dt_s"] = time.perf_counter() - before_lread_t
+        # leader_pos = {}
+        pos = self.leader_arm.read("Present_Position")
+        pos[3] += 180
+        pos[4] -= 90
+
+        pos[4] *= -1
+
+
+        tip_pose = RobotKinematics.fk_gripper_tip(pos)
+        tip_pose[:3, 3] += [0.3, -0.2, -0.5]
+
+        self.fv.pushFrame(tip_pose, "aze")
+
+        # print(pos[5])
+
+        try:
+            joints = self.reachy.r_arm.inverse_kinematics(tip_pose)
+            if self.initialized:
+                self.reachy.r_arm.shoulder.pitch.goal_position = joints[0]
+                self.reachy.r_arm.shoulder.roll.goal_position = joints[1]
+                self.reachy.r_arm.elbow.yaw.goal_position = joints[2]  
+                self.reachy.r_arm.elbow.pitch.goal_position = joints[3]
+                self.reachy.r_arm.wrist.roll.goal_position = joints[4]
+                self.reachy.r_arm.wrist.pitch.goal_position = joints[5]
+                self.reachy.r_arm.wrist.yaw.goal_position = joints[6]
+                gripper_opening = max(0, min(pos[5], 45))
+                gripper_opening /= 45
+                gripper_opening *= 100
+                self.reachy.r_arm.gripper.set_opening(gripper_opening)
+
+                self.reachy.r_arm.send_goal_positions(check_positions=False)
+            else:
+                self.reachy.r_arm.goto(tip_pose, duration=5, wait=True)
+                self.initialized = True
+                
+        except Exception as e:
+            print(e)
+            
+        # TODO gripper
 
 
         #TODO leader arm FK

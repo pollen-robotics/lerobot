@@ -54,9 +54,10 @@ REACHY_MOTORS = [
 class ReachyRobotConfig:
     robot_type: str | None = "reachy2"
     cameras: dict[str, ReachyCamera] = field(default_factory=lambda: {})
-    ip_address: str | None = "172.17.135.207"
+    # ip_address: str | None = "172.17.135.207"
     # ip_address: str | None = "192.168.0.197"
     # ip_address: str | None = "localhost"
+    ip_address: str | None = "172.17.134.85"
 
 
 class ReachyRobot:
