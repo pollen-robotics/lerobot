@@ -415,11 +415,6 @@ if __name__ == "__main__":
         help="A short but accurate description of the task performed during the recording.",
     )
     # TODO(aliberts): add multi-task support
-    # task_args.add_argument(
-    #     "--multi-task",
-    #     type=int,
-    #     help="You will need to enter the task performed at the start of each episode.",
-    # )
     parser_record.add_argument(
         "--root",
         type=Path,
@@ -496,12 +491,12 @@ if __name__ == "__main__":
             "Not enough threads might cause low camera fps."
         ),
     )
-    parser_record.add_argument(
-        "--resume",
-        type=int,
-        default=0,
-        help="Resume recording on an existing dataset.",
-    )
+    # parser_record.add_argument(
+    #     "--resume",
+    #     type=int,
+    #     default=0,
+    #     help="Resume recording on an existing dataset.",
+    # )
     parser_record.add_argument(
         "-p",
         "--pretrained-policy-name-or-path",
