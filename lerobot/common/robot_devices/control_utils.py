@@ -259,6 +259,7 @@ def control_loop(
         start_loop_t = time.perf_counter()
 
         if teleoperate:
+            print("azeazeaze")
             observation, action = robot.teleop_step(record_data=True)
         else:
             sssss = time.perf_counter()
