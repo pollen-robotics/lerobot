@@ -202,7 +202,7 @@ class ReachyRobot:
         if not record_data:
             return
 
-        build_dict_start = time.time()
+        # build_dict_start = time.time()
         action = {}
         action["neck_roll.pos"] = 0
         action["neck_pitch.pos"] = 0
@@ -228,15 +228,15 @@ class ReachyRobot:
         action["mobile_base_y.vel"] = 0
         action["mobile_base_theta.vel"] = 0
 
-        print("building dict took", time.time() - build_dict_start)
+        # print("building dict took", time.time() - build_dict_start)
 
         dtype = self.motor_features["action"]["dtype"]
         action = np.array(list(action.values()), dtype=dtype)
         # action = torch.as_tensor(list(action.values()))
 
-        capture_obs_start = time.time()
+        # capture_obs_start = time.time()
         obs_dict = self.capture_observation()
-        print("capture_observation took", time.time() - capture_obs_start)
+        # print("capture_observation took", time.time() - capture_obs_start)
         action_dict = {}
         action_dict["action"] = action
 
