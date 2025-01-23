@@ -283,6 +283,7 @@ def control_loop(
             cv2.waitKey(1)
 
         if fps is not None:
+            print("AAAAAAAAAAAAAAAAAA")
             dt_s = time.perf_counter() - start_loop_t
             busy_wait(1 / fps - dt_s)
 
