@@ -261,7 +261,9 @@ def control_loop(
         if teleoperate:
             observation, action = robot.teleop_step(record_data=True)
         else:
+            sssss = time.perf_counter()
             observation = robot.capture_observation()
+            print("capture_observation took", time.perf_counter() - sssss)
 
             if policy is not None:
                 pred_action = predict_action(observation, policy, device, use_amp)
