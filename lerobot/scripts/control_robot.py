@@ -238,13 +238,13 @@ def record(
             root=root,
             local_files_only=local_files_only,
         )
-        print("NUM IMAGE WRRITETRRRR", num_image_writer_threads_per_camera)
         dataset.start_image_writer(
             num_processes=num_image_writer_processes,
             num_threads=num_image_writer_threads_per_camera * len(robot.cameras),
         )
         sanity_check_dataset_robot_compatibility(dataset, robot, fps, video)
     else:
+        print("NUM IMAGE WRRITETRRRR", num_image_writer_threads_per_camera)
         # Create empty dataset or load existing saved episodes
         sanity_check_dataset_name(repo_id, policy)
         dataset = LeRobotDataset.create(
