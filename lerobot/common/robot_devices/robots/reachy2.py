@@ -17,6 +17,8 @@
 import time
 from copy import copy
 from dataclasses import dataclass, field, replace
+from threading import Thread
+from queue import Queue
 
 import numpy as np
 import torch
@@ -55,8 +57,7 @@ class ReachyRobotConfig:
     robot_type: str | None = "reachy2"
     cameras: dict[str, ReachyCamera] = field(default_factory=lambda: {})
     ip_address: str | None = "localhost"
-    # ip_address: str | None = "192.168.0.197"
-    # ip_address: str | None = "localhost"
+    # ip_address: str | None = "10.0.0.201"
 
 
 class ReachyRobot:
@@ -78,6 +79,10 @@ class ReachyRobot:
         self.logs = {}
         # self.reachy = None
         self.mobile_base_available = False
+
+        self.cameras_thread = None
+        self.images_queue = Queue(maxsize=1)
+        self.images = None
 
         self.state_keys = None
         self.action_keys = None
@@ -116,6 +121,24 @@ class ReachyRobot:
     def features(self):
         return {**self.motor_features, **self.camera_features}
 
+    def cameras_worker(self):
+        while True:
+            images = {}
+            for name in self.cameras:
+                # before_camread_t = time.perf_counter()
+                images[name] = self.cameras[name].read()
+                if images[name] is not None:
+                    # images[name] = torch.from_numpy(
+                    #     copy(images[name][0])
+                    # )  # seems like I need to copy?
+                    images[name] = torch.from_numpy(images[name][0])
+                    self.logs[f"read_camera_{name}_dt_s"] = images[name][
+                        1
+                    ]  # full timestamp, TODO dt
+
+            self.images_queue.put(images)
+            time.sleep(1 / 30)  # choose freq ?
+
     def connect(self) -> None:
         # self.reachy = ReachySDK(host=self.config.ip_address)
         print("Connecting to Reachy")
@@ -142,6 +165,8 @@ class ReachyRobot:
                 "Could not connect to the cameras, check that all cameras are plugged-in."
             )
             raise ConnectionError()
+
+        self.cameras_thread = Thread(target=self.cameras_worker).start()
 
         # self.mobile_base_available = self.reachy.mobile_base is not None
 
@@ -312,6 +337,14 @@ class ReachyRobot:
         else:
             return {}
 
+    def get_last_images(self):
+        try:
+            self.images = self.images_queue.get(False)  # non blocking
+        except Exception:
+            pass
+
+        return self.images
+
     def capture_observation(self) -> dict:
         if self.is_connected:
             before_read_t = time.perf_counter()
@@ -326,26 +359,29 @@ class ReachyRobot:
             # state = torch.as_tensor(list(state.values()))
 
             # Capture images from cameras
-            images = {}
-            for name in self.cameras:
-                # before_camread_t = time.perf_counter()
-                images[name] = self.cameras[
-                    name
-                ].read()  # Reachy cameras read() is not blocking?
-                # print(f'name: {name} img: {images[name]}')
-                if images[name] is not None:
-                    # images[name] = copy(images[name][0])  # seems like I need to copy?
-                    # images[name] = torch.from_numpy(
-                    #     copy(images[name][0])
-                    # )  # seems like I need to copy?
-                    images[name] = torch.from_numpy(
-                        images[name][0]
-                    )  # seems like I need to copy?
-                    self.logs[f"read_camera_{name}_dt_s"] = images[name][
-                        1
-                    ]  # full timestamp, TODO dt
+            # images = {}
+            # for name in self.cameras:
+            #     # before_camread_t = time.perf_counter()
+            #     images[name] = self.cameras[
+            #         name
+            #     ].read()  # Reachy cameras read() is not blocking?
+            #     # print(f'name: {name} img: {images[name]}')
+            #     if images[name] is not None:
+            #         # images[name] = copy(images[name][0])  # seems like I need to copy?
+            #         # images[name] = torch.from_numpy(
+            #         #     copy(images[name][0])
+            #         # )  # seems like I need to copy?
+            #         images[name] = torch.from_numpy(
+            #             images[name][0]
+            #         )  # seems like I need to copy?
+            #         self.logs[f"read_camera_{name}_dt_s"] = images[name][
+            #             1
+            #         ]  # full timestamp, TODO dt
 
             # Populate output dictionnaries
+            images = self.get_last_images()
+            if images is None:
+                return {}
             obs_dict = {}
             obs_dict["observation.state"] = state
             for name in self.cameras:

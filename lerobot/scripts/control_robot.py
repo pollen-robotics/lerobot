@@ -201,7 +201,7 @@ def record(
     push_to_hub: bool = True,
     tags: list[str] | None = None,
     num_image_writer_processes: int = 0,
-    num_image_writer_threads_per_camera: int = 1,
+    num_image_writer_threads_per_camera: int = 4,
     display_cameras: bool = True,
     play_sounds: bool = True,
     resume: bool = False,
@@ -244,7 +244,6 @@ def record(
         )
         sanity_check_dataset_robot_compatibility(dataset, robot, fps, video)
     else:
-        print("NUM IMAGE WRRITETRRRR", num_image_writer_threads_per_camera)
         # Create empty dataset or load existing saved episodes
         sanity_check_dataset_name(repo_id, policy)
         dataset = LeRobotDataset.create(
