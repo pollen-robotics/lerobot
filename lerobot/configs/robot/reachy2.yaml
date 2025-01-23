@@ -12,7 +12,7 @@ cameras:
   head_left:
     _target_: lerobot.common.robot_devices.cameras.reachy2.ReachyCamera
     name: teleop
-    host: 10.0.0.201
+    host: localhost
     # host: 192.168.0.197
     # host: localhost
     port: 50065
@@ -32,7 +32,7 @@ cameras:
   torso_rgb:
     _target_: lerobot.common.robot_devices.cameras.reachy2.ReachyCamera
     name: depth
-    host: 10.0.0.201
+    host: localhost
     # host: localhost
     port: 50065
     image_type: rgb
