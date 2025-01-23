@@ -11,7 +11,6 @@ def busy_wait(seconds):
         while time.perf_counter() < end_time:
             pass
     else:
-        print("AZKZKZKZK")
         # On Linux time.sleep is accurate
         if seconds > 0:
             time.sleep(seconds)

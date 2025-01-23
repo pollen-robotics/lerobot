@@ -201,7 +201,7 @@ def record(
     push_to_hub: bool = True,
     tags: list[str] | None = None,
     num_image_writer_processes: int = 0,
-    num_image_writer_threads_per_camera: int = 4,
+    num_image_writer_threads_per_camera: int = 1,
     display_cameras: bool = True,
     play_sounds: bool = True,
     resume: bool = False,
