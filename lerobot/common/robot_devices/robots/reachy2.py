@@ -76,7 +76,7 @@ class ReachyRobot:
         self.is_connected = False
         self.teleop = None
         self.logs = {}
-        self.reachy = None
+        # self.reachy = None
         self.mobile_base_available = False
 
         self.state_keys = None
@@ -117,17 +117,17 @@ class ReachyRobot:
         return {**self.motor_features, **self.camera_features}
 
     def connect(self) -> None:
-        self.reachy = ReachySDK(host=self.config.ip_address)
+        # self.reachy = ReachySDK(host=self.config.ip_address)
         print("Connecting to Reachy")
-        self.reachy.connect()
-        self.is_connected = self.reachy.is_connected
-        if not self.is_connected:
-            print(
-                f"Cannot connect to Reachy at address {self.config.ip_address}. Maybe a connection already exists."
-            )
-            raise ConnectionError()
+        # self.reachy.connect()
+        # self.is_connected = self.reachy.is_connected
+        # if not self.is_connected:
+        #     print(
+        #         f"Cannot connect to Reachy at address {self.config.ip_address}. Maybe a connection already exists."
+        #     )
+        #     raise ConnectionError()
         # self.reachy.turn_on()
-        print(self.cameras)
+        # print(self.cameras)
         if self.cameras is not None:
             for name in self.cameras:
                 print(f"Connecting camera: {name}")
@@ -142,7 +142,7 @@ class ReachyRobot:
             )
             raise ConnectionError()
 
-        self.mobile_base_available = self.reachy.mobile_base is not None
+        # self.mobile_base_available = self.reachy.mobile_base is not None
 
     def run_calibration(self):
         pass
@@ -439,4 +439,4 @@ class ReachyRobot:
         # self.reachy.turn_off_smoothly()
         # self.reachy.turn_off()
         print("\t turn off done")
-        self.reachy.disconnect()
+        # self.reachy.disconnect()
