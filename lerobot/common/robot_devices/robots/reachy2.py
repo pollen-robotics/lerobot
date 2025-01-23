@@ -121,6 +121,7 @@ class ReachyRobot:
         print("Connecting to Reachy")
         # self.reachy.connect()
         # self.is_connected = self.reachy.is_connected
+        self.is_connected = True
         # if not self.is_connected:
         #     print(
         #         f"Cannot connect to Reachy at address {self.config.ip_address}. Maybe a connection already exists."
