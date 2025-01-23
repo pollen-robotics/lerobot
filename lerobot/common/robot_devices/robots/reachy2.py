@@ -335,8 +335,11 @@ class ReachyRobot:
                 # print(f'name: {name} img: {images[name]}')
                 if images[name] is not None:
                     # images[name] = copy(images[name][0])  # seems like I need to copy?
+                    # images[name] = torch.from_numpy(
+                    #     copy(images[name][0])
+                    # )  # seems like I need to copy?
                     images[name] = torch.from_numpy(
-                        copy(images[name][0])
+                        images[name][0]
                     )  # seems like I need to copy?
                     self.logs[f"read_camera_{name}_dt_s"] = images[name][
                         1
