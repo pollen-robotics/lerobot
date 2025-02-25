@@ -20,17 +20,26 @@ hdf5_paths = glob(os.path.join(args.hdf5_path, 'episode_*.hdf5'))
 features = {
     "observation.state": {
         "dtype": "float32",
-        "shape": (19,),
+        "shape": (22,),
         "names": None
     },
     "action": {
         "dtype": "float32",
-        "shape": (19,),
+        "shape": (22,),
         "names": None
     },
-    "observation.image": {
+    "observation.images.cam_teleop": {
         "dtype": "video",
         "shape": (3, 720, 960),
+        "names": [
+            "channel",
+            "height",
+            "width",
+        ],
+    },
+    "observation.images.cam_trunk": {
+        "dtype": "video",
+        "shape": (3, 720, 1280),
         "names": [
             "channel",
             "height",
@@ -41,7 +50,7 @@ features = {
 
 
 dataset = LeRobotDataset.create(
-    repo_id="pollen-robotics/apple_storage",
+    repo_id="pollen-robotics/TMP_TESTTTT",
     fps=args.fps,
     robot_type="reachy2",
     features=features,
@@ -66,19 +75,25 @@ for hdf5_path in hdf5_paths:
         print("===", hdf5_path, "===")
         action = data["/action"][:]
         state = data["/observations/qpos"][:]
-        image_idx = data["/observations/images_ids/cam_teleop"][:]
+        image_idx = {}
+        image_idx["cam_trunk"] = data["/observations/images_ids/cam_trunk"][:]
+        image_idx["cam_teleop"] = data["/observations/images_ids/cam_teleop"][:]
 
+        cam_trunk_video_path = hdf5_path.replace(".hdf5", "_cam_trunk.mp4")
         cam_teleop_video_path = hdf5_path.replace(".hdf5", "_cam_teleop.mp4")
-        video_frames = get_video_frames(cam_teleop_video_path)
+
+        trunk_video_frames = get_video_frames(cam_trunk_video_path)
+        teleop_video_frames = get_video_frames(cam_teleop_video_path)
 
         for i in range(len(action)):
             frame = {
                 "action": torch.from_numpy(action[i]),
                 "observation.state": torch.from_numpy(state[i]),
-                "observation.image": torch.from_numpy(video_frames[image_idx[i]])
+                "observation.images.cam_trunk": torch.from_numpy(trunk_video_frames[image_idx["cam_trunk"][i]]),
+                "observation.images.cam_teleop": torch.from_numpy(teleop_video_frames[image_idx["cam_teleop"][i]]),
             }
             dataset.add_frame(frame)
-    dataset.save_episode(task="place the apple in the plate")
+    dataset.save_episode(task="TMP_TESTTTT")
 
 dataset.consolidate()
 

@@ -56,8 +56,8 @@ REACHY_MOTORS = [
 class ReachyRobotConfig:
     robot_type: str | None = "reachy2"
     cameras: dict[str, ReachyCamera] = field(default_factory=lambda: {})
-    ip_address: str | None = "localhost"
-    # ip_address: str | None = "10.0.0.201"
+    # ip_address: str | None = "localhost"
+    ip_address: str | None = "10.0.0.2"
 
 
 class ReachyRobot:
@@ -77,7 +77,7 @@ class ReachyRobot:
         self.is_connected = False
         self.teleop = None
         self.logs = {}
-        # self.reachy = None
+        self.reachy = None
         self.mobile_base_available = False
 
         self.cameras_thread = None
@@ -140,18 +140,18 @@ class ReachyRobot:
             time.sleep(1 / 30)  # choose freq ?
 
     def connect(self) -> None:
-        # self.reachy = ReachySDK(host=self.config.ip_address)
+        self.reachy = ReachySDK(host=self.config.ip_address)
         print("Connecting to Reachy")
-        # self.reachy.connect()
-        # self.is_connected = self.reachy.is_connected
+        self.reachy.connect()
+        self.is_connected = self.reachy.is_connected
         self.is_connected = True
-        # if not self.is_connected:
-        #     print(
-        #         f"Cannot connect to Reachy at address {self.config.ip_address}. Maybe a connection already exists."
-        #     )
-        #     raise ConnectionError()
-        # self.reachy.turn_on()
-        # print(self.cameras)
+        if not self.is_connected:
+            print(
+                f"Cannot connect to Reachy at address {self.config.ip_address}. Maybe a connection already exists."
+            )
+            raise ConnectionError()
+        self.reachy.turn_on()
+        print(self.cameras)
         if self.cameras is not None:
             for name in self.cameras:
                 print(f"Connecting camera: {name}")
@@ -168,141 +168,104 @@ class ReachyRobot:
 
         self.cameras_thread = Thread(target=self.cameras_worker).start()
 
-        # self.mobile_base_available = self.reachy.mobile_base is not None
+        self.mobile_base_available = self.reachy.mobile_base is not None
 
     def run_calibration(self):
         pass
-
-    # def teleop_step(
-    #     self, record_data=False
-    # ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    #     if not record_data:
-    #         return
-    #     action = {}
-    #     action["neck_roll.pos"] = self.reachy.head.neck.roll.goal_position
-    #     action["neck_pitch.pos"] = self.reachy.head.neck.pitch.goal_position
-    #     action["neck_yaw.pos"] = self.reachy.head.neck.yaw.goal_position
-
-    #     action["r_shoulder_pitch.pos"] = self.reachy.r_arm.shoulder.pitch.goal_position
-    #     action["r_shoulder_roll.pos"] = self.reachy.r_arm.shoulder.roll.goal_position
-    #     action["r_elbow_yaw.pos"] = self.reachy.r_arm.elbow.yaw.goal_position
-    #     action["r_elbow_pitch.pos"] = self.reachy.r_arm.elbow.pitch.goal_position
-    #     action["r_wrist_roll.pos"] = self.reachy.r_arm.wrist.roll.goal_position
-    #     action["r_wrist_pitch.pos"] = self.reachy.r_arm.wrist.pitch.goal_position
-    #     action["r_wrist_yaw.pos"] = self.reachy.r_arm.wrist.yaw.goal_position
-    #     action["r_gripper.pos"] = self.reachy.r_arm.gripper.opening
-
-    #     action["l_shoulder_pitch.pos"] = self.reachy.l_arm.shoulder.pitch.goal_position
-    #     action["l_shoulder_roll.pos"] = self.reachy.l_arm.shoulder.roll.goal_position
-    #     action["l_elbow_yaw.pos"] = self.reachy.l_arm.elbow.yaw.goal_position
-    #     action["l_elbow_pitch.pos"] = self.reachy.l_arm.elbow.pitch.goal_position
-    #     action["l_wrist_roll.pos"] = self.reachy.l_arm.wrist.roll.goal_position
-    #     action["l_wrist_pitch.pos"] = self.reachy.l_arm.wrist.pitch.goal_position
-    #     action["l_wrist_yaw.pos"] = self.reachy.l_arm.wrist.yaw.goal_position
-    #     action["l_gripper.pos"] = self.reachy.l_arm.gripper.opening
-
-    #     if self.mobile_base_available:
-    #         last_cmd_vel = self.reachy.mobile_base.last_cmd_vel
-    #         action["mobile_base_x.vel"] = last_cmd_vel["x"]
-    #         action["mobile_base_y.vel"] = last_cmd_vel["y"]
-    #         action["mobile_base_theta.vel"] = last_cmd_vel["theta"]
-    #     else:
-    #         action["mobile_base_x.vel"] = 0
-    #         action["mobile_base_y.vel"] = 0
-    #         action["mobile_base_theta.vel"] = 0
-
-    #     dtype = self.motor_features["action"]["dtype"]
-    #     action = np.array(list(action.values()), dtype=dtype)
-    #     # action = torch.as_tensor(list(action.values()))
-
-    #     obs_dict = self.capture_observation()
-    #     action_dict = {}
-    #     action_dict["action"] = action
-
-    #     return obs_dict, action_dict
 
     def teleop_step(
         self, record_data=False
     ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         if not record_data:
             return
-
-        # build_dict_start = time.time()
         action = {}
-        action["neck_roll.pos"] = 0
-        action["neck_pitch.pos"] = 0
-        action["neck_yaw.pos"] = 0
-        action["r_shoulder_pitch.pos"] = 0
-        action["r_shoulder_roll.pos"] = 0
-        action["r_elbow_yaw.pos"] = 0
-        action["r_elbow_pitch.pos"] = 0
-        action["r_wrist_roll.pos"] = 0
-        action["r_wrist_pitch.pos"] = 0
-        action["r_wrist_yaw.pos"] = 0
-        action["r_gripper.pos"] = 0
-        action["l_shoulder_pitch.pos"] = 0
-        action["l_shoulder_roll.pos"] = 0
-        action["l_elbow_yaw.pos"] = 0
-        action["l_elbow_pitch.pos"] = 0
-        action["l_wrist_roll.pos"] = 0
-        action["l_wrist_pitch.pos"] = 0
-        action["l_wrist_yaw.pos"] = 0
-        action["l_gripper.pos"] = 0
+        action["neck_roll.pos"] = self.reachy.head.neck.roll.goal_position
+        action["neck_pitch.pos"] = self.reachy.head.neck.pitch.goal_position
+        action["neck_yaw.pos"] = self.reachy.head.neck.yaw.goal_position
 
-        action["mobile_base_x.vel"] = 0
-        action["mobile_base_y.vel"] = 0
-        action["mobile_base_theta.vel"] = 0
+        action["r_shoulder_pitch.pos"] = self.reachy.r_arm.shoulder.pitch.goal_position
+        action["r_shoulder_roll.pos"] = self.reachy.r_arm.shoulder.roll.goal_position
+        action["r_elbow_yaw.pos"] = self.reachy.r_arm.elbow.yaw.goal_position
+        action["r_elbow_pitch.pos"] = self.reachy.r_arm.elbow.pitch.goal_position
+        action["r_wrist_roll.pos"] = self.reachy.r_arm.wrist.roll.goal_position
+        action["r_wrist_pitch.pos"] = self.reachy.r_arm.wrist.pitch.goal_position
+        action["r_wrist_yaw.pos"] = self.reachy.r_arm.wrist.yaw.goal_position
+        action["r_gripper.pos"] = self.reachy.r_arm.gripper.opening
 
-        # print("building dict took", time.time() - build_dict_start)
+        action["l_shoulder_pitch.pos"] = self.reachy.l_arm.shoulder.pitch.goal_position
+        action["l_shoulder_roll.pos"] = self.reachy.l_arm.shoulder.roll.goal_position
+        action["l_elbow_yaw.pos"] = self.reachy.l_arm.elbow.yaw.goal_position
+        action["l_elbow_pitch.pos"] = self.reachy.l_arm.elbow.pitch.goal_position
+        action["l_wrist_roll.pos"] = self.reachy.l_arm.wrist.roll.goal_position
+        action["l_wrist_pitch.pos"] = self.reachy.l_arm.wrist.pitch.goal_position
+        action["l_wrist_yaw.pos"] = self.reachy.l_arm.wrist.yaw.goal_position
+        action["l_gripper.pos"] = self.reachy.l_arm.gripper.opening
+
+        if self.mobile_base_available:
+            last_cmd_vel = self.reachy.mobile_base.last_cmd_vel
+            action["mobile_base_x.vel"] = last_cmd_vel["x"]
+            action["mobile_base_y.vel"] = last_cmd_vel["y"]
+            action["mobile_base_theta.vel"] = last_cmd_vel["theta"]
+        else:
+            action["mobile_base_x.vel"] = 0
+            action["mobile_base_y.vel"] = 0
+            action["mobile_base_theta.vel"] = 0
 
         dtype = self.motor_features["action"]["dtype"]
         action = np.array(list(action.values()), dtype=dtype)
         # action = torch.as_tensor(list(action.values()))
 
-        # capture_obs_start = time.time()
         obs_dict = self.capture_observation()
-        # print("capture_observation took", time.time() - capture_obs_start)
         action_dict = {}
         action_dict["action"] = action
 
         return obs_dict, action_dict
 
-    # def get_state(self) -> dict:
-    #     # neck roll, pitch, yaw
-    #     # r_shoulder_pitch, r_shoulder_roll, r_elbow_yaw, r_elbow_pitch, r_wrist_roll, r_wrist_pitch, r_wrist_yaw, r_gripper
-    #     # l_shoulder_pitch, l_shoulder_roll, l_elbow_yaw, l_elbow_pitch, l_wrist_roll, l_wrist_pitch, l_wrist_yaw, l_gripper
-    #     # mobile base x, y, theta
-    #     if self.is_connected:
-    #         if self.mobile_base_available:
-    #             odometry = self.reachy.mobile_base.odometry
-    #         else:
-    #             odometry = {"x": 0, "y": 0, "theta": 0, "vx": 0, "vy": 0, "vtheta": 0}
-    #         return {
-    #             "neck_yaw.pos": self.reachy.head.neck.yaw.present_position,
-    #             "neck_pitch.pos": self.reachy.head.neck.pitch.present_position,
-    #             "neck_roll.pos": self.reachy.head.neck.roll.present_position,
-    #             "r_shoulder_pitch.pos": self.reachy.r_arm.shoulder.pitch.present_position,
-    #             "r_shoulder_roll.pos": self.reachy.r_arm.shoulder.roll.present_position,
-    #             "r_elbow_yaw.pos": self.reachy.r_arm.elbow.yaw.present_position,
-    #             "r_elbow_pitch.pos": self.reachy.r_arm.elbow.pitch.present_position,
-    #             "r_wrist_roll.pos": self.reachy.r_arm.wrist.roll.present_position,
-    #             "r_wrist_pitch.pos": self.reachy.r_arm.wrist.pitch.present_position,
-    #             "r_wrist_yaw.pos": self.reachy.r_arm.wrist.yaw.present_position,
-    #             "r_gripper.pos": self.reachy.r_arm.gripper.present_position,
-    #             "l_shoulder_pitch.pos": self.reachy.l_arm.shoulder.pitch.present_position,
-    #             "l_shoulder_roll.pos": self.reachy.l_arm.shoulder.roll.present_position,
-    #             "l_elbow_yaw.pos": self.reachy.l_arm.elbow.yaw.present_position,
-    #             "l_elbow_pitch.pos": self.reachy.l_arm.elbow.pitch.present_position,
-    #             "l_wrist_roll.pos": self.reachy.l_arm.wrist.roll.present_position,
-    #             "l_wrist_pitch.pos": self.reachy.l_arm.wrist.pitch.present_position,
-    #             "l_wrist_yaw.pos": self.reachy.l_arm.wrist.yaw.present_position,
-    #             "l_gripper.pos": self.reachy.l_arm.gripper.present_position,
-    #             "mobile_base.vx": odometry["vx"],
-    #             "mobile_base.vy": odometry["vy"],
-    #             "mobile_base.vtheta": odometry["vtheta"],
-    #         }
-    #     else:
-    #         return {}
+    # def teleop_step(
+    #     self, record_data=False
+    # ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    #     if not record_data:
+    #         return
+
+    #     # build_dict_start = time.time()
+    #     action = {}
+    #     action["neck_roll.pos"] = 0
+    #     action["neck_pitch.pos"] = 0
+    #     action["neck_yaw.pos"] = 0
+    #     action["r_shoulder_pitch.pos"] = 0
+    #     action["r_shoulder_roll.pos"] = 0
+    #     action["r_elbow_yaw.pos"] = 0
+    #     action["r_elbow_pitch.pos"] = 0
+    #     action["r_wrist_roll.pos"] = 0
+    #     action["r_wrist_pitch.pos"] = 0
+    #     action["r_wrist_yaw.pos"] = 0
+    #     action["r_gripper.pos"] = 0
+    #     action["l_shoulder_pitch.pos"] = 0
+    #     action["l_shoulder_roll.pos"] = 0
+    #     action["l_elbow_yaw.pos"] = 0
+    #     action["l_elbow_pitch.pos"] = 0
+    #     action["l_wrist_roll.pos"] = 0
+    #     action["l_wrist_pitch.pos"] = 0
+    #     action["l_wrist_yaw.pos"] = 0
+    #     action["l_gripper.pos"] = 0
+
+    #     action["mobile_base_x.vel"] = 0
+    #     action["mobile_base_y.vel"] = 0
+    #     action["mobile_base_theta.vel"] = 0
+
+    #     # print("building dict took", time.time() - build_dict_start)
+
+    #     dtype = self.motor_features["action"]["dtype"]
+    #     action = np.array(list(action.values()), dtype=dtype)
+    #     # action = torch.as_tensor(list(action.values()))
+
+    #     # capture_obs_start = time.time()
+    #     obs_dict = self.capture_observation()
+    #     # print("capture_observation took", time.time() - capture_obs_start)
+    #     action_dict = {}
+    #     action_dict["action"] = action
+
+    #     return obs_dict, action_dict
 
     def get_state(self) -> dict:
         # neck roll, pitch, yaw
@@ -310,32 +273,69 @@ class ReachyRobot:
         # l_shoulder_pitch, l_shoulder_roll, l_elbow_yaw, l_elbow_pitch, l_wrist_roll, l_wrist_pitch, l_wrist_yaw, l_gripper
         # mobile base x, y, theta
         if self.is_connected:
+            if self.mobile_base_available:
+                odometry = self.reachy.mobile_base.odometry
+            else:
+                odometry = {"x": 0, "y": 0, "theta": 0, "vx": 0, "vy": 0, "vtheta": 0}
             return {
-                "neck_yaw.pos": 0,
-                "neck_pitch.pos": 0,
-                "neck_roll.pos": 0,
-                "r_shoulder_pitch.pos": 0,
-                "r_shoulder_roll.pos": 0,
-                "r_elbow_yaw.pos": 0,
-                "r_elbow_pitch.pos": 0,
-                "r_wrist_roll.pos": 0,
-                "r_wrist_pitch.pos": 0,
-                "r_wrist_yaw.pos": 0,
-                "r_gripper.pos": 0,
-                "l_shoulder_pitch.pos": 0,
-                "l_shoulder_roll.pos": 0,
-                "l_elbow_yaw.pos": 0,
-                "l_elbow_pitch.pos": 0,
-                "l_wrist_roll.pos": 0,
-                "l_wrist_pitch.pos": 0,
-                "l_wrist_yaw.pos": 0,
-                "l_gripper.pos": 0,
-                "mobile_base.vx": 0,
-                "mobile_base.vy": 0,
-                "mobile_base.vtheta": 0,
+                "neck_yaw.pos": self.reachy.head.neck.yaw.present_position,
+                "neck_pitch.pos": self.reachy.head.neck.pitch.present_position,
+                "neck_roll.pos": self.reachy.head.neck.roll.present_position,
+                "r_shoulder_pitch.pos": self.reachy.r_arm.shoulder.pitch.present_position,
+                "r_shoulder_roll.pos": self.reachy.r_arm.shoulder.roll.present_position,
+                "r_elbow_yaw.pos": self.reachy.r_arm.elbow.yaw.present_position,
+                "r_elbow_pitch.pos": self.reachy.r_arm.elbow.pitch.present_position,
+                "r_wrist_roll.pos": self.reachy.r_arm.wrist.roll.present_position,
+                "r_wrist_pitch.pos": self.reachy.r_arm.wrist.pitch.present_position,
+                "r_wrist_yaw.pos": self.reachy.r_arm.wrist.yaw.present_position,
+                "r_gripper.pos": self.reachy.r_arm.gripper.present_position,
+                "l_shoulder_pitch.pos": self.reachy.l_arm.shoulder.pitch.present_position,
+                "l_shoulder_roll.pos": self.reachy.l_arm.shoulder.roll.present_position,
+                "l_elbow_yaw.pos": self.reachy.l_arm.elbow.yaw.present_position,
+                "l_elbow_pitch.pos": self.reachy.l_arm.elbow.pitch.present_position,
+                "l_wrist_roll.pos": self.reachy.l_arm.wrist.roll.present_position,
+                "l_wrist_pitch.pos": self.reachy.l_arm.wrist.pitch.present_position,
+                "l_wrist_yaw.pos": self.reachy.l_arm.wrist.yaw.present_position,
+                "l_gripper.pos": self.reachy.l_arm.gripper.present_position,
+                "mobile_base.vx": odometry["vx"],
+                "mobile_base.vy": odometry["vy"],
+                "mobile_base.vtheta": odometry["vtheta"],
             }
         else:
             return {}
+
+    # def get_state(self) -> dict:
+    #     # neck roll, pitch, yaw
+    #     # r_shoulder_pitch, r_shoulder_roll, r_elbow_yaw, r_elbow_pitch, r_wrist_roll, r_wrist_pitch, r_wrist_yaw, r_gripper
+    #     # l_shoulder_pitch, l_shoulder_roll, l_elbow_yaw, l_elbow_pitch, l_wrist_roll, l_wrist_pitch, l_wrist_yaw, l_gripper
+    #     # mobile base x, y, theta
+    #     if self.is_connected:
+    #         return {
+    #             "neck_yaw.pos": 0,
+    #             "neck_pitch.pos": 0,
+    #             "neck_roll.pos": 0,
+    #             "r_shoulder_pitch.pos": 0,
+    #             "r_shoulder_roll.pos": 0,
+    #             "r_elbow_yaw.pos": 0,
+    #             "r_elbow_pitch.pos": 0,
+    #             "r_wrist_roll.pos": 0,
+    #             "r_wrist_pitch.pos": 0,
+    #             "r_wrist_yaw.pos": 0,
+    #             "r_gripper.pos": 0,
+    #             "l_shoulder_pitch.pos": 0,
+    #             "l_shoulder_roll.pos": 0,
+    #             "l_elbow_yaw.pos": 0,
+    #             "l_elbow_pitch.pos": 0,
+    #             "l_wrist_roll.pos": 0,
+    #             "l_wrist_pitch.pos": 0,
+    #             "l_wrist_yaw.pos": 0,
+    #             "l_gripper.pos": 0,
+    #             "mobile_base.vx": 0,
+    #             "mobile_base.vy": 0,
+    #             "mobile_base.vtheta": 0,
+    #         }
+    #     else:
+    #         return {}
 
     def get_last_images(self):
         try:

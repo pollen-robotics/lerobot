@@ -97,6 +97,7 @@ import argparse
 import logging
 import time
 from pathlib import Path
+import pickle
 from typing import List
 
 # from safetensors.torch import load_file, save_file
@@ -118,6 +119,9 @@ from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.robot_devices.utils import busy_wait, safe_disconnect
 from lerobot.common.utils.utils import init_hydra_config, init_logging, log_say, none_or_int
+import cProfile
+import pstats
+
 
 ########################################################################################
 # Control modes
@@ -202,7 +206,7 @@ def record(
     tags: list[str] | None = None,
     num_image_writer_processes: int = 0,
     num_image_writer_threads_per_camera: int = 4,
-    display_cameras: bool = True,
+    display_cameras: bool = False,
     play_sounds: bool = True,
     resume: bool = False,
     # TODO(rcadene, aliberts): remove local_files_only when refactor with dataset as argument
@@ -283,17 +287,22 @@ def record(
         #     task = input("Enter your task description: ")
 
         log_say(f"Recording episode {dataset.num_episodes}", play_sounds)
-        record_episode(
-            dataset=dataset,
-            robot=robot,
-            events=events,
-            episode_time_s=episode_time_s,
-            display_cameras=display_cameras,
-            policy=policy,
-            device=device,
-            use_amp=use_amp,
-            fps=fps,
-        )
+        with cProfile.Profile() as profile:
+            record_episode(
+                dataset=dataset,
+                robot=robot,
+                events=events,
+                episode_time_s=episode_time_s,
+                display_cameras=display_cameras,
+                policy=policy,
+                device=device,
+                use_amp=use_amp,
+                fps=fps,
+            )
+        profile_result = pstats.Stats(profile)
+        profile_result.print_stats()
+        profile_result.dump_stats("profile_result.dat")
+        exit()
 
         # Execute a few seconds without recording to give time to manually reset the environment
         # Current code logic doesn't allow to teleoperate during this time.
@@ -548,6 +557,8 @@ if __name__ == "__main__":
     del kwargs["mode"]
     del kwargs["robot_path"]
     del kwargs["robot_overrides"]
+
+
 
     robot_cfg = init_hydra_config(robot_path, robot_overrides)
     robot = make_robot(robot_cfg)

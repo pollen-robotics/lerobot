@@ -4,7 +4,6 @@
 # With pip: `pip install -e ".[reachy2]"`
 # With poetry: `poetry install --sync --extras "reachy2"`
 
-
 _target_: lerobot.common.robot_devices.robots.reachy2.ReachyRobot
 robot_type: reachy2
 
@@ -12,8 +11,8 @@ cameras:
   head_left:
     _target_: lerobot.common.robot_devices.cameras.reachy2.ReachyCamera
     name: teleop
-    host: localhost
-    # host: 10.0.0.201
+    # host: localhost
+    host: 10.0.0.2
     port: 50065
     fps: 30
     width: 960
@@ -31,8 +30,8 @@ cameras:
   torso_rgb:
     _target_: lerobot.common.robot_devices.cameras.reachy2.ReachyCamera
     name: depth
-    host: localhost
-    # host: 10.0.0.201
+    # host: localhost
+    host: 10.0.0.2
     port: 50065
     image_type: rgb
     fps: 30
