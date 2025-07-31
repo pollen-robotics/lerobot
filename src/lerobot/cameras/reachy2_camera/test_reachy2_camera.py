@@ -2,7 +2,7 @@ from lerobot.cameras.reachy2_camera import Reachy2Camera, Reachy2CameraConfig
 import time
 
 
-camera_config = Reachy2CameraConfig(name="teleop", image_type="left")
+camera_config = Reachy2CameraConfig(name="teleop", image_type="left", ip_address="172.18.131.66")
 camera = Reachy2Camera(camera_config)
 
 camera.connect()

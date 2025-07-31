@@ -55,7 +55,8 @@ class Reachy2CameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     ip_address: str | None = "localhost"
-    port: int = 50065
+    port: int = 8443
+    producer_peer_name: str = "robot"
     # use_depth: bool = False
 
     def __post_init__(self):

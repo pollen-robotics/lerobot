@@ -33,12 +33,9 @@ import numpy as np
 
 from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-from reachy2_sdk import ReachySDK
-from reachy2_sdk.media.camera import CameraView
-from reachy2_sdk.media.camera_manager import CameraManager
-
 from ..camera import Camera
 from .configuration_reachy2_camera import ColorMode, Reachy2CameraConfig
+from .gst_recorder import GstRecorder
 
 
 logger = logging.getLogger(__name__)
@@ -73,7 +70,7 @@ class Reachy2Camera(Camera):
         self.fps = config.fps
         self.color_mode = config.color_mode
 
-        self.reachy2_sdk: ReachySDK | None = None
+        self.recorder: GstRecorder | None = None
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
@@ -87,16 +84,17 @@ class Reachy2Camera(Camera):
     @property
     def is_connected(self) -> bool:
         """Checks if the camera is currently connected and opened."""
-        return (self.reachy.is_connected() and self.reachy.cameras.teleop is not None and self.reachy.cameras.depth is not None) if self.reachy is not None else False
+        return True
 
     def connect(self, warmup: bool = True):
         """
         Connects to the Reachy2 CameraManager as specified in the configuration.
         """
-        self.reachy = ReachySDK(self.config.ip_address)
-
-        self.cam_manager = CameraManager(host=self.config.ip_address, port=self.config.port)
-        self.cam_manager.initialize_cameras()
+        self.recorder = GstRecorder(
+            self.config.ip_address, self.config.port, None, self.config.producer_peer_name
+        )
+        print(self.recorder)
+        self.recorder.record()
 
         logger.info(f"{self} connected.")
         print(f"{self} connected.")
@@ -137,16 +135,18 @@ class Reachy2Camera(Camera):
 
         frame = None
 
-        if self.config.name == "teleop" and hasattr(self.cam_manager, "teleop"):
+        if self.config.name == "teleop":
             if self.config.image_type == "left":
-                frame = self.cam_manager.teleop.get_frame(CameraView.LEFT)[0]
+                frame = self.recorder.get_image(left=True)
             elif self.config.image_type == "right":
-                frame = self.cam_manager.teleop.get_frame(CameraView.RIGHT)[0]
-        elif self.config.name == "depth" and hasattr(self.cam_manager, "depth"):
-            if self.config.image_type == "depth":
-                frame = self.cam_manager.depth.get_depth_frame()[0]
-            elif self.config.image_type == "rgb":
-                frame = self.cam_manager.depth.get_frame()[0]
+                frame = self.recorder.get_image(left=False)
+
+        # DEPTH NOT IMPLEMENTED TRHOUGH GSTREAMER
+        # elif self.config.name == "depth" and hasattr(self.cam_manager, "depth"):
+        #     if self.config.image_type == "depth":
+        #         frame = self.cam_manager.depth.get_depth_frame()[0]
+        #     elif self.config.image_type == "rgb":
+        #         frame = self.cam_manager.depth.get_frame()[0]
 
         if frame is None:
             return None
@@ -155,6 +155,7 @@ class Reachy2Camera(Camera):
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         read_duration_ms = (time.perf_counter() - start_time) * 1e3
+        # print(f"{self} read took: {read_duration_ms:.1f}ms")
         logger.debug(f"{self} read took: {read_duration_ms:.1f}ms")
 
         return frame
