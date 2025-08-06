@@ -7,17 +7,26 @@ from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import _init_rerun
 from lerobot.record import record_loop
 
-NUM_EPISODES = 2
-FPS = 30
-EPISODE_TIME_SEC = 5
+
+NUM_EPISODES = 3
+FPS = 15
+EPISODE_TIME_SEC = 15
 RESET_TIME_SEC = 5
 TASK_DESCRIPTION = "My task description"
 
 # Create the robot and teleoperator configurations
 robot_config = Reachy2RobotConfig(
-    id="test_reachy"
+    # ip_address="localhost",
+    # ip_address="172.18.131.66",
+    ip_address="192.168.0.199",
+    id="reachy2-pvt02",
+    use_external_commands=True,
 )
-teleop_config = Reachy2FakeTeleoperatorConfig()
+teleop_config = Reachy2FakeTeleoperatorConfig(
+    ip_address="192.168.0.199",
+    # ip_address="172.18.131.66",
+    # ip_address="192.168.0.200",
+)
 
 # Initialize the robot and teleoperator
 robot = Reachy2Robot(robot_config)
