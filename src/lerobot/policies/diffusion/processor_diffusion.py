@@ -19,11 +19,13 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
@@ -46,13 +48,15 @@ def make_diffusion_pre_post_processors(
 
     The pre-processing pipeline prepares the input data for the model by:
     1. Renaming features.
-    2. Normalizing the input and output features based on dataset statistics.
-    3. Adding a batch dimension.
-    4. Moving the data to the specified device.
+    2. Adding a batch dimension.
+    3. Moving the data to the specified device.
+    4. Converting absolute actions to relative (if ``use_relative_actions`` is enabled).
+    5. Normalizing the input and output features based on dataset statistics.
 
     The post-processing pipeline handles the model's output by:
-    1. Moving the data to the CPU.
-    2. Unnormalizing the output features to their original scale.
+    1. Unnormalizing the output features to their original scale.
+    2. Converting relative actions back to absolute (if ``use_relative_actions`` is enabled).
+    3. Moving the data to the CPU.
 
     Args:
         config: The configuration object for the diffusion policy,
@@ -64,10 +68,21 @@ def make_diffusion_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    # Shared instance: the postprocessor's AbsoluteActionsProcessorStep reads
+    # the cached state from this step to reverse the delta conversion.
+    relative_step = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=config.relative_exclude_joints,
+        action_names=config.action_feature_names,
+    )
+
+    # Ordering: relative step runs after device (needs consistent device/dtype)
+    # and before normalization (stats must be computed on delta values).
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+        relative_step,
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
@@ -78,6 +93,7 @@ def make_diffusion_pre_post_processors(
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
         ),
+        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
     ]
     return (

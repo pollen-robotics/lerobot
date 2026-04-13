@@ -152,6 +152,14 @@ class DiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # Relative actions: converts absolute actions to relative (action -= state).
+    # When enabled, Cartesian dims are converted to deltas while excluded joints stay absolute.
+    use_relative_actions: bool = False
+    # Joint names to exclude from relative conversion (kept absolute). Empty list = all dims relative.
+    relative_exclude_joints: list[str] = field(default_factory=list)
+    # Populated at runtime from dataset metadata by make_policy(). Do not set manually.
+    action_feature_names: list[str] | None = None
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
