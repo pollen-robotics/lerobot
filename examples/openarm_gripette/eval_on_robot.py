@@ -1,17 +1,20 @@
 """Deploy a trained Diffusion Policy on an OpenArm robot.
 
-Runs the Gripette policy in closed-loop on a real OpenArm:
-  1. Reads joint positions and computes FK to get Cartesian EE pose.
-  2. Reads the gripper camera image.
-  3. Preprocesses (normalize, relative actions).
-  4. Runs DiffusionPolicy.select_action() to get delta Cartesian + gripper targets.
-  5. Postprocesses (unnormalize, deltas -> absolute).
-  6. Runs IK to convert Cartesian targets to joint angles.
-  7. Sends joint commands to the robot.
+Runs the Gripette policy in closed-loop on a real OpenArm. The policy operates in
+11D state/action space with 6D continuous rotation:
+  [x, y, z, r6d_0..r6d_5, proximal, distal]
 
-The policy uses action chunking with receding horizon control: every n_action_steps
-(default 8) control steps, a new 16-step action trajectory is generated. Between
-generations, actions are popped from an internal queue.
+Pipeline per control step:
+  1. Read joint encoders + gripper + camera from the robot.
+  2. FK: joint angles -> Cartesian EE pose (4x4 matrix).
+  3. Convert rotation matrix -> 6D representation.
+  4. Build 11D state vector + camera image.
+  5. Preprocess (normalize, relative actions).
+  6. DiffusionPolicy.select_action() -> delta 11D action (from action chunk queue).
+  7. Postprocess (unnormalize, deltas -> absolute).
+  8. Convert 6D rotation back to rotation matrix for IK.
+  9. IK: Cartesian target -> joint angles.
+  10. Send joint commands to the robot.
 
 See README.md in this directory for the full setup guide.
 
@@ -33,13 +36,16 @@ import time
 
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
 
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.model import RobotKinematics
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.diffusion import DiffusionPolicy
 from lerobot.robots.openarm_follower import OpenArmFollower, OpenArmFollowerConfig
+from lerobot.utils.rotation import (
+    rotation_6d_to_rotation_matrix_numpy,
+    rotation_matrix_to_rotation_6d_numpy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +88,7 @@ R_FK_TO_SLAM = np.eye(3)
 
 
 # ---------------------------------------------------------------------------
-# Kinematics helpers
+# Kinematics helpers (11D with 6D rotation)
 # ---------------------------------------------------------------------------
 
 
@@ -91,7 +97,9 @@ def fk_to_state(
     joint_angles_deg: np.ndarray,
     gripper_joints: np.ndarray,
 ) -> np.ndarray:
-    """Compute the 8D observation state from joint angles via forward kinematics.
+    """Compute the 11D observation state from joint angles via forward kinematics.
+
+    Converts the FK rotation matrix to 6D continuous representation.
 
     Args:
         kin: RobotKinematics instance (placo + URDF).
@@ -99,37 +107,42 @@ def fk_to_state(
         gripper_joints: Gripper joint positions in degrees (2D).
 
     Returns:
-        8D state vector: [x, y, z, rx, ry, rz, grip_1, grip_2]
-        Position in meters, orientation as rotation vector, gripper in degrees.
+        11D state vector: [x, y, z, r6d_0..r6d_5, proximal, distal]
+        Position in meters, orientation as 6D rotation, gripper in degrees.
     """
     tf_matrix = kin.forward_kinematics(joint_angles_deg)
 
     # Apply optional frame rotation to bring FK output into the SLAM frame.
     pos = R_FK_TO_SLAM @ tf_matrix[:3, 3]
     rot_matrix = R_FK_TO_SLAM @ tf_matrix[:3, :3]
-    rotvec = Rotation.from_matrix(rot_matrix).as_rotvec()
 
-    return np.concatenate([pos, rotvec, gripper_joints])
+    # Convert 3x3 rotation matrix to 6D representation (first two columns)
+    rot_6d = rotation_matrix_to_rotation_6d_numpy(rot_matrix.reshape(1, 3, 3)).squeeze(0)
+
+    return np.concatenate([pos, rot_6d, gripper_joints])
 
 
 def state_to_ik_target(cart_state: np.ndarray) -> np.ndarray:
-    """Build a 4x4 SE(3) matrix from the first 6 dims of the state vector.
+    """Build a 4x4 SE(3) matrix from the first 9 dims of the 11D state.
 
-    Applies the inverse of the FK-to-SLAM rotation so the IK solver works
-    in the robot's native frame.
+    Converts the 6D rotation back to a rotation matrix and applies the inverse
+    of the FK-to-SLAM rotation so the IK solver works in the robot's native frame.
 
     Args:
-        cart_state: [x, y, z, rx, ry, rz] in the SLAM frame.
+        cart_state: [x, y, z, r6d_0..r6d_5] (9D) in the SLAM frame.
 
     Returns:
         4x4 homogeneous transformation matrix in the FK frame.
     """
     pos_slam = cart_state[:3]
-    rotvec_slam = cart_state[3:6]
+    rot_6d = cart_state[3:9]
 
-    # Rotate from SLAM frame back to robot FK frame.
+    # Recover 3x3 rotation matrix from 6D via Gram-Schmidt
+    rot_matrix_slam = rotation_6d_to_rotation_matrix_numpy(rot_6d.reshape(1, 6)).squeeze(0)
+
+    # Rotate from SLAM frame back to robot FK frame
     pos_fk = R_FK_TO_SLAM.T @ pos_slam
-    rot_matrix_fk = R_FK_TO_SLAM.T @ Rotation.from_rotvec(rotvec_slam).as_matrix()
+    rot_matrix_fk = R_FK_TO_SLAM.T @ rot_matrix_slam
 
     tf_target = np.eye(4)
     tf_target[:3, :3] = rot_matrix_fk
@@ -181,8 +194,8 @@ def main():
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
 
     logger.info(
-        f"Policy: n_action_steps={policy.config.n_action_steps}, "
-        f"horizon={policy.config.horizon}, "
+        f"Policy: action_dim={policy.config.action_feature.shape[0]}, "
+        f"n_action_steps={policy.config.n_action_steps}, "
         f"relative_actions={policy.config.use_relative_actions}"
     )
 
@@ -221,7 +234,7 @@ def main():
             gripper_joints = np.array([obs[f"{j}.pos"] for j in GRIPPER_JOINT_NAMES], dtype=np.float64)
             camera_image = obs["gripper"]  # (H, W, C) uint8 numpy array
 
-            # --- 2. FK: joint angles -> Cartesian state ---
+            # --- 2. FK: joint angles -> 11D Cartesian state (with 6D rotation) ---
             state = fk_to_state(kin, arm_joints, gripper_joints)
 
             # --- 3. Build policy input tensors ---
@@ -231,23 +244,23 @@ def main():
 
             batch = {
                 "observation.state": state_tensor.unsqueeze(0).to(device),
-                "observation.images.gripper": image_tensor.unsqueeze(0).to(device),
+                "observation.images.cam0": image_tensor.unsqueeze(0).to(device),
             }
 
             # --- 4. Preprocess -> Policy -> Postprocess ---
-            # Preprocessor: adds batch dim, normalizes, converts to relative actions.
+            # Preprocessor: normalizes, converts to relative actions.
             # select_action: generates/pops from action chunk queue.
             # Postprocessor: unnormalizes, converts deltas back to absolute.
             batch = preprocessor(batch)
             action = policy.select_action(batch)
             action = postprocessor(action)
 
-            # --- 5. Extract Cartesian + gripper targets ---
+            # --- 5. Extract Cartesian + gripper targets (11D) ---
             action_np = action.squeeze(0).cpu().numpy()
-            cart_target = action_np[:6]  # [x, y, z, rx, ry, rz] absolute
-            gripper_target = action_np[6:]  # [grip_1, grip_2] absolute
+            cart_target = action_np[:9]  # [x, y, z, r6d_0..r6d_5] absolute
+            gripper_target = action_np[9:]  # [proximal, distal] absolute
 
-            # --- 6. IK: Cartesian target -> joint angles ---
+            # --- 6. IK: Cartesian target (with 6D rotation) -> joint angles ---
             ee_target = state_to_ik_target(cart_target)
             joint_targets_deg = kin.inverse_kinematics(
                 current_joint_pos=arm_joints,
