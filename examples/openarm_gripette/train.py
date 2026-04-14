@@ -1,25 +1,24 @@
 """Train a Diffusion Policy with relative actions for the Gripette project.
 
 This script trains a DiffusionPolicy on a dataset recorded with a hand-mounted SLAM
-device. The dataset contains absolute Cartesian poses + gripper joints + camera images.
-During training, Cartesian dims are automatically converted to deltas by the processor
-pipeline while gripper joints stay absolute.
+device. The dataset uses 6D continuous rotation representation (11D state/action):
+  [x, y, z, r6d_0..r6d_5, proximal, distal]
+
+Position + rotation dims are converted to deltas by RelativeActionsProcessorStep,
+while gripper joints (proximal, distal) stay absolute.
 
 See README.md in this directory for the full setup guide.
 
 Prerequisites:
   - Dataset exists locally or on HuggingFace Hub.
-  - Dataset stats recomputed for relative actions:
-      uv run lerobot-edit-dataset \\
-          --repo-id <DATASET_REPO_ID> \\
-          --operation.type recompute_stats \\
-          --operation.relative_action true \\
-          --operation.relative_exclude_joints "['grip_1', 'grip_2']" \\
-          --operation.chunk_size 16
+  - Rotation converted to 6D format:
+      uv run python examples/openarm_gripette/convert_rotation_6d.py
+    (This also recomputes stats with relative actions.)
 
 Usage:
   uv run python examples/openarm_gripette/train.py
-  uv run python examples/openarm_gripette/train.py --dataset_repo_id pollen/gripette_demo --batch_size 64
+  uv run python examples/openarm_gripette/train.py \\
+      --dataset_repo_id SteveNguyen/Grabette_redcube_quest --batch_size 64
 """
 
 import argparse
@@ -61,11 +60,22 @@ def parse_args():
     parser.add_argument("--log_freq", type=int, default=100, help="Log every N steps")
     parser.add_argument("--save_freq", type=int, default=10_000, help="Save checkpoint every N steps")
     parser.add_argument(
+        "--wandb_project", type=str, default=None, help="Wandb project name (None = disabled)"
+    )
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name")
+    parser.add_argument(
         "--gripper_joints",
         type=str,
         nargs="+",
-        default=["grip_1", "grip_2"],
+        default=["proximal", "distal"],
         help="Gripper joint names to exclude from relative action conversion",
+    )
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        nargs="+",
+        default=["observation.images.cam0"],
+        help="Camera feature keys to use as input (others are excluded)",
     )
     return parser.parse_args()
 
@@ -83,7 +93,13 @@ def main():
     features = dataset_to_policy_features(dataset_metadata.features)
 
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+    # Filter input features: keep only selected cameras + non-visual features.
+    # This excludes cameras not listed in --cameras (e.g., cam1 when only cam0 is used).
+    input_features = {
+        key: ft
+        for key, ft in features.items()
+        if key not in output_features and (ft.type is not FeatureType.VISUAL or key in args.cameras)
+    }
 
     # The action feature names are needed by RelativeActionsProcessorStep to build
     # the exclude_joints mask (it matches names like "grip_1" against this list).
@@ -97,41 +113,39 @@ def main():
     print(f"Gripper excluded: {args.gripper_joints}")
 
     # ---- Policy configuration ----
-    # The config defines both the model architecture and the processor pipeline settings.
+    # Parameters are aligned with the UMI (Universal Manipulation Interface) project,
+    # which is a known-working diffusion policy for SLAM-recorded Cartesian datasets.
+    # See docs/umi_analysis.md for the full comparison.
     cfg = DiffusionConfig(
         input_features=input_features,
         output_features=output_features,
-        # -- Temporal structure --
-        # n_obs_steps=2: condition on the current and previous observation.
-        # horizon=16: predict 16 future action steps.
-        # n_action_steps=8: execute 8 before re-planning (receding horizon).
+        # -- Temporal structure (same as UMI) --
         n_obs_steps=2,
         horizon=16,
         n_action_steps=8,
         # -- Vision encoder --
-        # ResNet18 with GroupNorm (required when not using pretrained weights).
-        # SpatialSoftmax extracts 32 keypoints from the feature maps.
+        # ResNet18 with GroupNorm + SpatialSoftmax (32 keypoints).
+        # UMI uses ViT-base (CLIP pretrained), but ResNet18 is lighter and faster.
+        # Images resized to 224x224 (standard for pretrained vision models).
+        # No cropping — resize only to preserve full field of view.
         vision_backbone="resnet18",
-        resize_shape=(240, 320),
-        crop_ratio=0.9,
-        crop_is_random=True,
+        resize_shape=(224, 224),
+        crop_ratio=1.0,  # 1.0 = no crop, resize only
         pretrained_backbone_weights=None,
         use_group_norm=True,
         spatial_softmax_num_keypoints=32,
-        # -- U-Net --
-        # 3-stage 1D convolutional U-Net with FiLM conditioning.
-        # (256, 512, 1024) is sufficient for 8D actions. The default (512, 1024, 2048)
-        # is designed for higher-dimensional action spaces (e.g., bimanual).
+        # -- U-Net (same as UMI) --
         down_dims=(256, 512, 1024),
         kernel_size=5,
         n_groups=8,
         diffusion_step_embed_dim=128,
         use_film_scale_modulation=True,
         # -- Diffusion scheduler --
-        # DDPM with cosine beta schedule and epsilon prediction.
-        # 100 denoising steps at training; same at inference unless overridden.
-        noise_scheduler_type="DDPM",
-        num_train_timesteps=100,
+        # DDIM with 50 training steps and 16 inference steps (matching UMI).
+        # DDIM is ~6x faster than DDPM at inference with minimal quality loss.
+        noise_scheduler_type="DDIM",
+        num_train_timesteps=50,
+        num_inference_steps=16,
         beta_schedule="squaredcos_cap_v2",
         prediction_type="epsilon",
         clip_sample=True,
@@ -148,12 +162,12 @@ def main():
         use_relative_actions=True,
         relative_exclude_joints=args.gripper_joints,
         action_feature_names=list(action_feature_names) if action_feature_names else None,
-        # -- Optimizer --
-        optimizer_lr=1e-4,
+        # -- Optimizer (matching UMI: lr=3e-4, warmup=2000) --
+        optimizer_lr=3e-4,
         optimizer_betas=(0.95, 0.999),
         optimizer_weight_decay=1e-6,
         scheduler_name="cosine",
-        scheduler_warmup_steps=500,
+        scheduler_warmup_steps=2000,
     )
 
     # ---- Instantiate policy ----
@@ -199,12 +213,47 @@ def main():
     # ---- Optimizer ----
     optimizer = cfg.get_optimizer_preset().build(policy.parameters())
 
+    # ---- Wandb ----
+    use_wandb = args.wandb_project is not None
+    if use_wandb:
+        import wandb
+
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "dataset": args.dataset_repo_id,
+                "batch_size": args.batch_size,
+                "training_steps": args.training_steps,
+                "lr": cfg.optimizer_lr,
+                "warmup_steps": cfg.scheduler_warmup_steps,
+                "n_obs_steps": cfg.n_obs_steps,
+                "horizon": cfg.horizon,
+                "n_action_steps": cfg.n_action_steps,
+                "noise_scheduler": cfg.noise_scheduler_type,
+                "num_train_timesteps": cfg.num_train_timesteps,
+                "num_inference_steps": cfg.num_inference_steps,
+                "vision_backbone": cfg.vision_backbone,
+                "resize_shape": cfg.resize_shape,
+                "down_dims": cfg.down_dims,
+                "use_relative_actions": cfg.use_relative_actions,
+                "relative_exclude_joints": cfg.relative_exclude_joints,
+                "action_dim": cfg.action_feature.shape[0],
+                "state_dim": cfg.robot_state_feature.shape[0],
+                "cameras": args.cameras,
+                "model_params": param_count,
+            },
+        )
+
     # ---- Training loop ----
     print(f"\nStarting training for {args.training_steps} steps on {device}")
     print(f"  Batch size:       {args.batch_size}")
     print(f"  Dataset frames:   {len(dataset)}")
     print(f"  Relative actions: enabled (excluding {args.gripper_joints})")
-    print(f"  Checkpoints:      {output_dir}\n")
+    print(f"  Checkpoints:      {output_dir}")
+    if use_wandb:
+        print(f"  Wandb:            {args.wandb_project}")
+    print()
 
     step = 0
     done = False
@@ -220,8 +269,13 @@ def main():
             optimizer.step()
             optimizer.zero_grad()
 
+            loss_val = loss.item()
+
+            if use_wandb:
+                wandb.log({"loss": loss_val, "step": step})
+
             if step % args.log_freq == 0:
-                print(f"step: {step:>7d} / {args.training_steps}  loss: {loss.item():.4f}")
+                print(f"step: {step:>7d} / {args.training_steps}  loss: {loss_val:.4f}")
 
             # Periodic checkpoint
             if step > 0 and step % args.save_freq == 0:
@@ -244,6 +298,9 @@ def main():
     preprocessor.save_pretrained(output_dir)
     postprocessor.save_pretrained(output_dir)
     print(f"\nTraining complete. Model saved to {output_dir}")
+
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

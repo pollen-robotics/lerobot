@@ -14,9 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom rotation utilities to replace scipy.spatial.transform.Rotation."""
+"""Rotation utilities: Rotation class and 6D continuous rotation representation.
+
+The 6D representation (Zhou et al., "On the Continuity of Rotation Representations
+in Neural Networks", CVPR 2019) encodes a 3x3 rotation matrix as 6 values — the first
+two columns. The third column is recovered via cross product and Gram-Schmidt
+orthogonalization. This representation is continuous (no singularities) and has better
+gradient properties than quaternions or Euler angles for neural network training.
+"""
+
+from __future__ import annotations
 
 import numpy as np
+import torch
 
 
 class Rotation:
@@ -35,7 +45,7 @@ class Rotation:
             self._quat = self._quat / norm
 
     @classmethod
-    def from_rotvec(cls, rotvec: np.ndarray) -> "Rotation":
+    def from_rotvec(cls, rotvec: np.ndarray) -> Rotation:
         """
         Create rotation from rotation vector using Rodrigues' formula.
 
@@ -63,7 +73,7 @@ class Rotation:
         return cls(quat)
 
     @classmethod
-    def from_matrix(cls, matrix: np.ndarray) -> "Rotation":
+    def from_matrix(cls, matrix: np.ndarray) -> Rotation:
         """
         Create rotation from 3x3 rotation matrix.
 
@@ -107,7 +117,7 @@ class Rotation:
         return cls(quat)
 
     @classmethod
-    def from_quat(cls, quat: np.ndarray) -> "Rotation":
+    def from_quat(cls, quat: np.ndarray) -> Rotation:
         """
         Create rotation from quaternion.
 
@@ -221,7 +231,7 @@ class Rotation:
 
         return rotated_vectors
 
-    def inv(self) -> "Rotation":
+    def inv(self) -> Rotation:
         """
         Invert this rotation.
 
@@ -237,7 +247,7 @@ class Rotation:
 
         return Rotation(inverse_quat)
 
-    def __mul__(self, other: "Rotation") -> "Rotation":
+    def __mul__(self, other: Rotation) -> Rotation:
         """
         Compose this rotation with another rotation using the * operator.
 
@@ -268,3 +278,262 @@ class Rotation:
         )
 
         return Rotation(composed_quat)
+
+
+# ---------------------------------------------------------------------------
+# 6D continuous rotation representation (Zhou et al., CVPR 2019)
+#
+# The idea: represent a 3x3 rotation matrix R as its first two columns
+# (6 floats). To recover R, apply Gram-Schmidt orthogonalization:
+#   b1 = normalize(a1)
+#   b2 = normalize(a2 - <b1, a2> * b1)
+#   b3 = b1 x b2
+#   R  = [b1 | b2 | b3]
+#
+# This is continuous (no wrapping), differentiable, and singularity-free.
+# ---------------------------------------------------------------------------
+
+
+def rotation_matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
+    """Convert rotation matrices to 6D rotation representation.
+
+    Extracts the first two columns of the rotation matrix.
+
+    Args:
+        matrix: Rotation matrices of shape (..., 3, 3).
+
+    Returns:
+        6D rotation vectors of shape (..., 6).
+    """
+    return matrix[..., :2, :].reshape(*matrix.shape[:-2], 6)
+
+
+def rotation_6d_to_rotation_matrix(rot_6d: torch.Tensor) -> torch.Tensor:
+    """Convert 6D rotation representation to rotation matrices.
+
+    Applies Gram-Schmidt orthogonalization to recover a valid rotation matrix
+    from the 6D representation (two arbitrary 3D vectors).
+
+    Args:
+        rot_6d: 6D rotation vectors of shape (..., 6).
+
+    Returns:
+        Rotation matrices of shape (..., 3, 3).
+    """
+    a1 = rot_6d[..., :3]
+    a2 = rot_6d[..., 3:]
+
+    # Gram-Schmidt: orthogonalize and normalize
+    b1 = torch.nn.functional.normalize(a1, dim=-1)
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = torch.nn.functional.normalize(b2, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+
+    return torch.stack([b1, b2, b3], dim=-2)
+
+
+def quaternion_to_rotation_6d(quat: torch.Tensor) -> torch.Tensor:
+    """Convert quaternions to 6D rotation representation.
+
+    Args:
+        quat: Quaternions of shape (..., 4) in [x, y, z, w] convention.
+
+    Returns:
+        6D rotation vectors of shape (..., 6).
+    """
+    matrix = _quaternion_to_matrix(quat)
+    return rotation_matrix_to_rotation_6d(matrix)
+
+
+def rotation_6d_to_quaternion(rot_6d: torch.Tensor) -> torch.Tensor:
+    """Convert 6D rotation representation to quaternions.
+
+    Args:
+        rot_6d: 6D rotation vectors of shape (..., 6).
+
+    Returns:
+        Quaternions of shape (..., 4) in [x, y, z, w] convention.
+    """
+    matrix = rotation_6d_to_rotation_matrix(rot_6d)
+    return _matrix_to_quaternion(matrix)
+
+
+def rotvec_to_rotation_6d(rotvec: torch.Tensor) -> torch.Tensor:
+    """Convert rotation vectors (axis-angle) to 6D rotation representation.
+
+    Args:
+        rotvec: Rotation vectors of shape (..., 3), where direction is the
+            rotation axis and magnitude is the angle in radians.
+
+    Returns:
+        6D rotation vectors of shape (..., 6).
+    """
+    matrix = _rotvec_to_matrix(rotvec)
+    return rotation_matrix_to_rotation_6d(matrix)
+
+
+def rotation_6d_to_rotvec(rot_6d: torch.Tensor) -> torch.Tensor:
+    """Convert 6D rotation representation to rotation vectors (axis-angle).
+
+    Args:
+        rot_6d: 6D rotation vectors of shape (..., 6).
+
+    Returns:
+        Rotation vectors of shape (..., 3).
+    """
+    matrix = rotation_6d_to_rotation_matrix(rot_6d)
+    return _matrix_to_rotvec(matrix)
+
+
+# --- Numpy convenience wrappers ---
+
+
+def rotation_matrix_to_rotation_6d_numpy(matrix: np.ndarray) -> np.ndarray:
+    """Convert rotation matrices to 6D rotation representation (numpy).
+
+    Args:
+        matrix: Rotation matrices of shape (..., 3, 3).
+
+    Returns:
+        6D rotation vectors of shape (..., 6).
+    """
+    return matrix[..., :2, :].reshape(*matrix.shape[:-2], 6)
+
+
+def rotation_6d_to_rotation_matrix_numpy(rot_6d: np.ndarray) -> np.ndarray:
+    """Convert 6D rotation representation to rotation matrices (numpy).
+
+    Args:
+        rot_6d: 6D rotation vectors of shape (..., 6).
+
+    Returns:
+        Rotation matrices of shape (..., 3, 3).
+    """
+    a1 = rot_6d[..., :3]
+    a2 = rot_6d[..., 3:]
+
+    # Gram-Schmidt: orthogonalize and normalize
+    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-12)
+    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-12)
+    b3 = np.cross(b1, b2, axis=-1)
+
+    return np.stack([b1, b2, b3], axis=-2)
+
+
+# ---------------------------------------------------------------------------
+# Internal torch rotation conversion helpers
+# ---------------------------------------------------------------------------
+
+
+def _quaternion_to_matrix(quat: torch.Tensor) -> torch.Tensor:
+    """Quaternion [x, y, z, w] to 3x3 rotation matrix."""
+    x, y, z, w = quat.unbind(dim=-1)
+
+    return torch.stack(
+        [
+            1 - 2 * (y * y + z * z),
+            2 * (x * y - z * w),
+            2 * (x * z + y * w),
+            2 * (x * y + z * w),
+            1 - 2 * (x * x + z * z),
+            2 * (y * z - x * w),
+            2 * (x * z - y * w),
+            2 * (y * z + x * w),
+            1 - 2 * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(*quat.shape[:-1], 3, 3)
+
+
+def _matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
+    """3x3 rotation matrix to quaternion [x, y, z, w]. Shepherd's method."""
+    batch_shape = matrix.shape[:-2]
+    m00, m01, m02 = matrix[..., 0, 0], matrix[..., 0, 1], matrix[..., 0, 2]
+    m10, m11, m12 = matrix[..., 1, 0], matrix[..., 1, 1], matrix[..., 1, 2]
+    m20, m21, m22 = matrix[..., 2, 0], matrix[..., 2, 1], matrix[..., 2, 2]
+
+    trace = m00 + m11 + m22
+    quat = torch.zeros(*batch_shape, 4, device=matrix.device, dtype=matrix.dtype)
+
+    # Case 1: trace > 0
+    s = torch.sqrt(torch.clamp(trace + 1.0, min=1e-10)) * 2
+    mask = trace > 0
+    quat[mask, 0] = ((m21 - m12) / s)[mask]
+    quat[mask, 1] = ((m02 - m20) / s)[mask]
+    quat[mask, 2] = ((m10 - m01) / s)[mask]
+    quat[mask, 3] = (0.25 * s)[mask]
+
+    # Case 2: m00 is max diagonal
+    mask2 = (~mask) & (m00 > m11) & (m00 > m22)
+    s2 = torch.sqrt(torch.clamp(1.0 + m00 - m11 - m22, min=1e-10)) * 2
+    quat[mask2, 0] = (0.25 * s2)[mask2]
+    quat[mask2, 1] = ((m01 + m10) / s2)[mask2]
+    quat[mask2, 2] = ((m02 + m20) / s2)[mask2]
+    quat[mask2, 3] = ((m21 - m12) / s2)[mask2]
+
+    # Case 3: m11 is max diagonal
+    mask3 = (~mask) & (~mask2) & (m11 > m22)
+    s3 = torch.sqrt(torch.clamp(1.0 + m11 - m00 - m22, min=1e-10)) * 2
+    quat[mask3, 0] = ((m01 + m10) / s3)[mask3]
+    quat[mask3, 1] = (0.25 * s3)[mask3]
+    quat[mask3, 2] = ((m12 + m21) / s3)[mask3]
+    quat[mask3, 3] = ((m02 - m20) / s3)[mask3]
+
+    # Case 4: m22 is max diagonal
+    mask4 = (~mask) & (~mask2) & (~mask3)
+    s4 = torch.sqrt(torch.clamp(1.0 + m22 - m00 - m11, min=1e-10)) * 2
+    quat[mask4, 0] = ((m02 + m20) / s4)[mask4]
+    quat[mask4, 1] = ((m12 + m21) / s4)[mask4]
+    quat[mask4, 2] = (0.25 * s4)[mask4]
+    quat[mask4, 3] = ((m10 - m01) / s4)[mask4]
+
+    # Normalize
+    quat = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-12)
+    return quat
+
+
+def _rotvec_to_matrix(rotvec: torch.Tensor) -> torch.Tensor:
+    """Rotation vector (axis-angle) to 3x3 rotation matrix via Rodrigues' formula."""
+    angle = torch.norm(rotvec, dim=-1, keepdim=True)
+    axis = rotvec / (angle + 1e-12)
+
+    # Components for Rodrigues' formula: R = I + sin(a)*K + (1-cos(a))*K^2
+    cos_a = torch.cos(angle).unsqueeze(-1)
+    sin_a = torch.sin(angle).unsqueeze(-1)
+
+    # Skew-symmetric matrix K from axis
+    kx, ky, kz = axis.unbind(dim=-1)
+    zero = torch.zeros_like(kx)
+    skew = torch.stack([zero, -kz, ky, kz, zero, -kx, -ky, kx, zero], dim=-1).reshape(
+        *rotvec.shape[:-1], 3, 3
+    )
+
+    eye = torch.eye(3, device=rotvec.device, dtype=rotvec.dtype).expand_as(skew)
+    matrix = eye + sin_a * skew + (1 - cos_a) * (skew @ skew)
+
+    # For very small angles, use identity
+    small = (angle.squeeze(-1) < 1e-8).unsqueeze(-1).unsqueeze(-1)
+    matrix = torch.where(small, eye, matrix)
+
+    return matrix
+
+
+def _matrix_to_rotvec(matrix: torch.Tensor) -> torch.Tensor:
+    """3x3 rotation matrix to rotation vector (axis-angle)."""
+    quat = _matrix_to_quaternion(matrix)
+
+    # Ensure w > 0 for unique representation
+    sign = torch.sign(quat[..., 3:])
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    quat = quat * sign
+
+    x, y, z, w = quat.unbind(dim=-1)
+    angle = 2.0 * torch.acos(torch.clamp(w, -1.0, 1.0))
+    sin_half = torch.sqrt(torch.clamp(1.0 - w * w, min=1e-12))
+
+    # For small angles: rotvec ≈ 2 * [x, y, z]
+    small = sin_half < 1e-8
+    scale = torch.where(small, 2.0 * torch.ones_like(angle), angle / sin_half)
+
+    return torch.stack([x * scale, y * scale, z * scale], dim=-1)

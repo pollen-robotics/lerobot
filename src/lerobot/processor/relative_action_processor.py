@@ -126,6 +126,13 @@ class RelativeActionsProcessorStep(ProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
 
+        # When state has a temporal dimension from multi-step observations
+        # (e.g., shape (B, n_obs_steps, D) with n_obs_steps > 1), select the
+        # last timestep as the reference for the relative conversion.
+        # This is the "current" observation state.
+        if state is not None and state.ndim >= 3:
+            state = state[:, -1]
+
         # Always cache state for the paired AbsoluteActionsProcessorStep
         if state is not None:
             self._last_state = state

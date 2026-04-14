@@ -63,19 +63,31 @@ up. Since the policy uses **relative/delta actions**, the unknown origin does no
 
 ### State and Action Space
 
-The policy operates in an 8-dimensional state/action space:
+The policy operates in an **11-dimensional** state/action space using 6D continuous
+rotation representation (Zhou et al., CVPR 2019):
 
 ```
-Index:   0    1    2    3    4    5    6       7
-Name:    x    y    z    rx   ry   rz   grip_1  grip_2
-         |-------- relative --------|  |-- absolute --|
+Index:   0    1    2    3      4      5      6      7      8      9         10
+Name:    x    y    z    r6d_0  r6d_1  r6d_2  r6d_3  r6d_4  r6d_5  proximal  distal
+         |------------- relative (delta) ------------|      |--- absolute ---|
 ```
 
 - **Dims 0-2**: Cartesian position (meters). Converted to deltas during training.
-- **Dims 3-5**: Orientation as rotation vector (converted from quaternion). Converted to
-  deltas during training.
-- **Dims 6-7**: Gripper joint angles (degrees). Stay absolute -- they represent physical
-  open/close state, not a trajectory in space.
+- **Dims 3-8**: 6D rotation (first two columns of rotation matrix). Continuous, no
+  singularities. Converted to deltas during training. See `lerobot.utils.rotation` for
+  conversion functions.
+- **Dims 9-10**: Gripper joint angles (degrees). Stay absolute -- they represent
+  physical open/close state, not a trajectory in space.
+
+#### Why 6D rotation instead of axis-angle or quaternion?
+
+The 6D representation extracts the first two columns of the 3x3 rotation matrix (6
+values). The third column is recovered via Gram-Schmidt orthogonalization. Benefits:
+
+- **Continuous**: No singularities (unlike rotation vectors which wrap near pi).
+- **Better gradients**: Smoother loss landscape for neural network training.
+- **Bounded values**: Rotation matrix columns have magnitude ~1, so normalization
+  statistics are well-behaved (unlike rotation vectors that can range [-pi, +pi]).
 
 ### Relative (Delta) Actions
 
@@ -135,6 +147,7 @@ The kinematics use the `placo` library with the OpenArm URDF model. The
 ```
 examples/openarm_gripette/
     README.md                  # This file
+    convert_rotation_6d.py     # Convert dataset from axis-angle to 6D rotation
     train.py                   # Training script
     eval_on_robot.py           # Deployment script (inference on real OpenArm)
 ```
@@ -163,37 +176,38 @@ uv sync --locked --extra training
 
 ### Dataset
 
-A LeRobot dataset recorded with the SLAM device, containing:
+A LeRobot dataset recorded with the SLAM device, after conversion to 6D rotation:
 
-- `observation.state`: shape `(8,)`, names `["x", "y", "z", "rx", "ry", "rz", "grip_1", "grip_2"]`
-- `observation.images.gripper`: video frames `(720, 960, 3)`
-- `action`: shape `(8,)`, same names as state
+- `observation.state`: shape `(11,)`, names `["x", "y", "z", "r6d_0", ..., "r6d_5", "proximal", "distal"]`
+- `observation.images.cam0`: video frames `(3, 720, 960)`
+- `action`: shape `(11,)`, same names as state
 
-> **Note**: Adjust the feature names throughout the scripts if your dataset uses different
-> names. The critical requirement is that `relative_exclude_joints` matches the exact
-> gripper joint names in your dataset.
+The raw dataset may use axis-angle orientation — the conversion script handles this
+(see Step 1 below).
+
+> **Note**: The `relative_exclude_joints` list must match the exact gripper joint names
+> in your dataset (e.g., `["proximal", "distal"]`).
 
 ## Step-by-Step Guide
 
-### Step 1: Recompute Dataset Statistics for Relative Actions
+### Step 1: Convert Rotation to 6D and Recompute Stats
 
-The dataset stores absolute positions, but the model trains on deltas. The normalization
-statistics must be computed in the delta space so that MIN_MAX normalization is correct.
+The conversion script transforms axis-angle rotation (3D) to 6D continuous
+representation, adds `observation.state` if missing, and recomputes normalization
+statistics with relative actions:
 
 ```bash
-uv run lerobot-edit-dataset \
-    --repo-id <YOUR_DATASET_REPO_ID> \
-    --operation.type recompute_stats \
-    --operation.relative_action true \
-    --operation.relative_exclude_joints "['grip_1', 'grip_2']" \
-    --operation.chunk_size 16
+uv run python examples/openarm_gripette/convert_rotation_6d.py \
+    --repo_id <YOUR_DATASET_REPO_ID>
 ```
 
-**Sanity check**: After recomputing, inspect `stats.json`:
+This converts the state/action from 8D to 11D and recomputes stats in one step.
 
-- Action min/max for dims 0-5 should be small values (millimeter-scale per-frame deltas
-  at 50 FPS).
-- Action min/max for dims 6-7 (gripper) should span the full gripper range (absolute).
+**Sanity check**: After conversion, inspect `stats.json`:
+
+- Action min/max for position dims (x, y, z) should be small (cm-scale deltas).
+- Action min/max for rotation dims (r6d_0..r6d_5) should be bounded (~[-0.6, +0.6]).
+- Action min/max for gripper dims (proximal, distal) should span the full range (absolute).
 - State min/max should span the full workspace (absolute positions).
 
 ### Step 2: Train the Policy
