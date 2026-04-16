@@ -1,19 +1,19 @@
-"""Train a Diffusion Policy with relative actions for the Gripette project.
+"""Train a Diffusion Policy for the Gripette project.
 
-This script trains a DiffusionPolicy on a dataset recorded with a hand-mounted SLAM
-device. The dataset uses 6D continuous rotation representation (11D state/action):
-  [x, y, z, r6d_0..r6d_5, proximal, distal]
+This script trains a DiffusionPolicy on a dataset prepared by convert_dataset.py:
+  - observation.state = [proximal, distal]  (2D gripper joints — no absolute position)
+  - action = [dx, dy, dz, dr6d_0..5, proximal, distal]  (11D: deltas + gripper)
+  - observation.images.cam0 = camera image
 
-Position + rotation dims are converted to deltas by RelativeActionsProcessorStep,
-while gripper joints (proximal, distal) stay absolute.
+The model sees camera + gripper state as input, and predicts delta actions.
+No absolute position is fed to the model (it's meaningless in the SLAM reference frame).
+Delta actions are pre-computed in the dataset (following the UMI approach).
 
 See README.md in this directory for the full setup guide.
 
 Prerequisites:
-  - Dataset exists locally or on HuggingFace Hub.
-  - Rotation converted to 6D format:
-      uv run python examples/openarm_gripette/convert_rotation_6d.py
-    (This also recomputes stats with relative actions.)
+  - Dataset converted with convert_dataset.py:
+      uv run python examples/openarm_gripette/convert_dataset.py
 
 Usage:
   uv run python examples/openarm_gripette/train.py
@@ -64,13 +64,6 @@ def parse_args():
     )
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name")
     parser.add_argument(
-        "--gripper_joints",
-        type=str,
-        nargs="+",
-        default=["proximal", "distal"],
-        help="Gripper joint names to exclude from relative action conversion",
-    )
-    parser.add_argument(
         "--cameras",
         type=str,
         nargs="+",
@@ -110,7 +103,6 @@ def main():
     print(f"Input features:   {list(input_features.keys())}")
     print(f"Output features:  {list(output_features.keys())}")
     print(f"Action names:     {action_feature_names}")
-    print(f"Gripper excluded: {args.gripper_joints}")
 
     # ---- Policy configuration ----
     # Parameters are aligned with the UMI (Universal Manipulation Interface) project,
@@ -156,12 +148,10 @@ def main():
             "STATE": NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MIN_MAX,
         },
-        # -- Relative actions --
-        # Converts Cartesian + orientation dims to deltas (action -= state).
-        # Gripper joints are excluded and stay as absolute targets.
-        use_relative_actions=True,
-        relative_exclude_joints=args.gripper_joints,
-        action_feature_names=list(action_feature_names) if action_feature_names else None,
+        # -- No RelativeActionsProcessorStep needed --
+        # Delta actions are pre-computed in the dataset by convert_dataset.py.
+        # observation.state = gripper only (2D), no absolute position.
+        use_relative_actions=False,
         # -- Optimizer (matching UMI: lr=3e-4, warmup=2000) --
         optimizer_lr=3e-4,
         optimizer_betas=(0.95, 0.999),
@@ -249,7 +239,7 @@ def main():
     print(f"\nStarting training for {args.training_steps} steps on {device}")
     print(f"  Batch size:       {args.batch_size}")
     print(f"  Dataset frames:   {len(dataset)}")
-    print(f"  Relative actions: enabled (excluding {args.gripper_joints})")
+    print("  Actions:          pre-computed deltas (11D)")
     print(f"  Checkpoints:      {output_dir}")
     if use_wandb:
         print(f"  Wandb:            {args.wandb_project}")
