@@ -40,6 +40,23 @@ def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[flo
     return [i / fps for i in delta_indices]
 
 
+@torch.no_grad()
+def compute_val_loss(policy, preprocessor, val_dataloader, device, max_batches=50):
+    """Compute average loss on the validation set."""
+    policy.eval()
+    total_loss = 0.0
+    num_batches = 0
+    for batch in val_dataloader:
+        batch = preprocessor(batch)
+        loss, _ = policy.forward(batch)
+        total_loss += loss.item()
+        num_batches += 1
+        if num_batches >= max_batches:
+            break
+    policy.train()
+    return total_loss / max(num_batches, 1)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Diffusion Policy for Gripette")
     parser.add_argument(
@@ -57,8 +74,18 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda", help="Compute device")
     parser.add_argument("--batch_size", type=int, default=64, help="Training batch size")
     parser.add_argument("--training_steps", type=int, default=200_000, help="Total training steps")
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=8,
+        help="Actions executed before re-planning (4=reactive, 8=default, 16=smooth)",
+    )
     parser.add_argument("--log_freq", type=int, default=100, help="Log every N steps")
     parser.add_argument("--save_freq", type=int, default=10_000, help="Save checkpoint every N steps")
+    parser.add_argument("--eval_freq", type=int, default=200, help="Evaluate on validation set every N steps")
+    parser.add_argument(
+        "--val_ratio", type=float, default=0.1, help="Fraction of episodes used for validation"
+    )
     parser.add_argument(
         "--wandb_project", type=str, default=None, help="Wandb project name (None = disabled)"
     )
@@ -114,7 +141,7 @@ def main():
         # -- Temporal structure (same as UMI) --
         n_obs_steps=2,
         horizon=16,
-        n_action_steps=8,
+        n_action_steps=args.n_action_steps,
         # -- Vision encoder --
         # ResNet18 with GroupNorm + SpatialSoftmax (32 keypoints).
         # UMI uses ViT-base (CLIP pretrained), but ResNet18 is lighter and faster.
@@ -189,15 +216,38 @@ def main():
         for k in cfg.image_features
     }
 
-    dataset = LeRobotDataset(args.dataset_repo_id, delta_timestamps=delta_timestamps)
+    # ---- Train/val split by episodes ----
+    all_episodes = sorted(dataset_metadata.episodes["episode_index"])
+    num_val = max(1, int(len(all_episodes) * args.val_ratio))
+    # Use last episodes as validation (deterministic split, no randomness)
+    val_episodes = all_episodes[-num_val:]
+    train_episodes = all_episodes[:-num_val]
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
+    train_dataset = LeRobotDataset(
+        args.dataset_repo_id, delta_timestamps=delta_timestamps, episodes=train_episodes
+    )
+    val_dataset = LeRobotDataset(
+        args.dataset_repo_id, delta_timestamps=delta_timestamps, episodes=val_episodes
+    )
+
+    print(f"  Train episodes:   {len(train_episodes)} ({len(train_dataset)} frames)")
+    print(f"  Val episodes:     {len(val_episodes)} ({len(val_dataset)} frames)")
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
         num_workers=4,
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=device.type != "cpu",
+        drop_last=False,
+        num_workers=2,
     )
 
     # ---- Optimizer ----
@@ -238,19 +288,19 @@ def main():
     # ---- Training loop ----
     print(f"\nStarting training for {args.training_steps} steps on {device}")
     print(f"  Batch size:       {args.batch_size}")
-    print(f"  Dataset frames:   {len(dataset)}")
     print("  Actions:          pre-computed deltas (11D)")
+    print(f"  Eval every:       {args.eval_freq} steps")
     print(f"  Checkpoints:      {output_dir}")
     if use_wandb:
         print(f"  Wandb:            {args.wandb_project}")
     print()
 
+    best_val_loss = float("inf")
     step = 0
     done = False
     while not done:
-        for batch in dataloader:
-            # Forward pass: preprocessor normalizes and converts to deltas,
-            # then the diffusion model computes the denoising loss.
+        for batch in train_dataloader:
+            # Forward pass
             batch = preprocessor(batch)
             loss, _ = policy.forward(batch)
 
@@ -259,13 +309,36 @@ def main():
             optimizer.step()
             optimizer.zero_grad()
 
-            loss_val = loss.item()
+            train_loss = loss.item()
+
+            # ---- Validation ----
+            val_loss = None
+            if step > 0 and step % args.eval_freq == 0:
+                val_loss = compute_val_loss(policy, preprocessor, val_dataloader, device)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    # Save best checkpoint
+                    best_dir = output_dir / "best"
+                    policy.save_pretrained(best_dir)
+                    preprocessor.save_pretrained(best_dir)
+                    postprocessor.save_pretrained(best_dir)
+
+                print(
+                    f"step: {step:>7d} / {args.training_steps}  "
+                    f"train_loss: {train_loss:.4f}  val_loss: {val_loss:.4f}  "
+                    f"best_val: {best_val_loss:.4f}" + (" *" if val_loss <= best_val_loss else "")
+                )
 
             if use_wandb:
-                wandb.log({"loss": loss_val, "step": step})
+                log_dict = {"train_loss": train_loss, "step": step}
+                if val_loss is not None:
+                    log_dict["val_loss"] = val_loss
+                    log_dict["best_val_loss"] = best_val_loss
+                wandb.log(log_dict)
 
-            if step % args.log_freq == 0:
-                print(f"step: {step:>7d} / {args.training_steps}  loss: {loss_val:.4f}")
+            if step % args.log_freq == 0 and val_loss is None:
+                print(f"step: {step:>7d} / {args.training_steps}  train_loss: {train_loss:.4f}")
 
             # Periodic checkpoint
             if step > 0 and step % args.save_freq == 0:

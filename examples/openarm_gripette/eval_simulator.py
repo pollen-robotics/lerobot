@@ -1,32 +1,18 @@
 """Run a trained Diffusion Policy on the OpenArm Gripette simulator.
 
-Connects to the gRPC simulator and runs closed-loop inference:
-  1. Get camera image + gripper joints from GripperService.
-  2. Build observation: state=[proximal, distal] + camera image.
-  3. Run DiffusionPolicy → 11D delta action [dx,dy,dz, dr6d_0..5, grip_1, grip_2].
-  4. Send position+rotation deltas to ArmService (IK handled server-side).
-  5. Send gripper goals to GripperService.
-
-The model does NOT see absolute EE position (it's meaningless in the SLAM frame).
-Actions are raw deltas — no RelativeActionsProcessorStep needed.
-
-The simulator exposes the same gRPC API as the real robot, so this script
-works with both by changing the host/port.
-
-Prerequisites:
-  - Simulator running: python -m openarm_gripette_simu [--headless]
-  - Trained checkpoint from train.py
-  - Generated gRPC stubs accessible (pip install openarm_gripette_simu)
+Connects to the gRPC simulator and runs closed-loop inference.
+Auto-detects the observation.state mode from the checkpoint:
+  - 2D state (gripper only): just reads gripper joints from the camera stream.
+  - 11D state (relative proprioception): also reads EE pose from ArmService,
+    computes position + rotation relative to the episode start.
 
 Usage:
   uv run python examples/openarm_gripette/eval_simulator.py \\
-      --checkpoint outputs/gripette/diffusion \\
-      --duration 30
+      --checkpoint outputs/gripette/diffusion --duration 30
 
-  # Custom host/ports:
+  # Debug mode (shows camera feed + detailed state/action log):
   uv run python examples/openarm_gripette/eval_simulator.py \\
-      --checkpoint outputs/gripette/diffusion \\
-      --arm_addr localhost:50052 --gripper_addr localhost:50051
+      --checkpoint outputs/gripette/diffusion --debug --no_send
 """
 
 import argparse
@@ -41,6 +27,10 @@ import torch
 
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.diffusion import DiffusionPolicy
+from lerobot.utils.rotation import (
+    rotation_6d_to_rotation_matrix_numpy,
+    rotation_matrix_to_rotation_6d_numpy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,18 +41,14 @@ logger = logging.getLogger(__name__)
 
 
 class CameraStreamReader:
-    """Reads the GripperService.StreamState() gRPC stream in a background thread.
+    """Reads GripperService.StreamState() in a background thread."""
 
-    Keeps the latest camera frame and gripper motor positions available for
-    the main inference loop. The stream runs at ~10 Hz from the simulator.
-    """
-
-    def __init__(self, gripper_stub):
+    def __init__(self, gripper_stub, gripper_pb2):
         self._stub = gripper_stub
+        self._gripper_pb2 = gripper_pb2
         self._lock = threading.Lock()
         self._latest_image: np.ndarray | None = None
         self._latest_gripper: np.ndarray | None = None
-        self._frame_count = 0
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -70,7 +56,6 @@ class CameraStreamReader:
         self._running = True
         self._thread = threading.Thread(target=self._stream_loop, daemon=True)
         self._thread.start()
-        # Wait for the first frame
         deadline = time.time() + 5.0
         while self._latest_image is None and time.time() < deadline:
             time.sleep(0.05)
@@ -84,39 +69,71 @@ class CameraStreamReader:
             self._thread.join(timeout=2.0)
 
     def get_latest(self) -> tuple[np.ndarray, np.ndarray]:
-        """Returns (image_rgb, gripper_joints) from the latest stream frame.
-
-        image_rgb: (H, W, 3) uint8 numpy array
-        gripper_joints: (2,) float array [proximal, distal] in radians
-        """
+        """Returns (image_rgb, gripper_joints)."""
         with self._lock:
             if self._latest_image is None:
                 raise RuntimeError("No camera frame available yet")
             return self._latest_image.copy(), self._latest_gripper.copy()
 
     def _stream_loop(self):
-        from openarm_gripette_simu.proto import gripper_pb2
-
         try:
-            for frame in self._stub.StreamState(gripper_pb2.StreamRequest()):
+            for frame in self._stub.StreamState(self._gripper_pb2.StreamRequest()):
                 if not self._running:
                     break
-                # Decode JPEG to numpy array (BGR from cv2, convert to RGB)
                 img_bgr = cv2.imdecode(np.frombuffer(frame.jpeg_data, np.uint8), cv2.IMREAD_COLOR)
                 img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
                 gripper = np.array(
                     [frame.motor_state.motor1_position, frame.motor_state.motor2_position],
                     dtype=np.float32,
                 )
-
                 with self._lock:
                     self._latest_image = img_rgb
                     self._latest_gripper = gripper
-                    self._frame_count += 1
         except grpc.RpcError as e:
             if self._running:
                 logger.error(f"Camera stream error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Relative proprioception helpers
+# ---------------------------------------------------------------------------
+
+
+def compute_relative_state(
+    arm_state, gripper_joints: np.ndarray, start_pos: np.ndarray, start_rot_matrix: np.ndarray
+) -> np.ndarray:
+    """Compute 11D state: position + rotation relative to episode start, plus gripper.
+
+    Args:
+        arm_state: gRPC ArmState with x, y, z, r6d fields.
+        gripper_joints: (2,) array [proximal, distal].
+        start_pos: (3,) position at episode start.
+        start_rot_matrix: (3, 3) rotation matrix at episode start.
+
+    Returns:
+        (11,) array: [dx_start, dy_start, dz_start, r6d_rel_0..5, proximal, distal]
+    """
+    pos = np.array([arm_state.x, arm_state.y, arm_state.z], dtype=np.float32)
+    rot_6d = np.array(list(arm_state.r6d), dtype=np.float32)
+
+    # Position relative to start
+    rel_pos = pos - start_pos
+
+    # Rotation relative to start: R_rel = R_current @ R_start^{-1}
+    r_current = rotation_6d_to_rotation_matrix_numpy(rot_6d.reshape(1, 6))[0]
+    r_relative = r_current @ start_rot_matrix.T
+    rel_rot_6d = rotation_matrix_to_rotation_6d_numpy(r_relative.reshape(1, 3, 3))[0]
+
+    return np.concatenate([rel_pos, rel_rot_6d, gripper_joints])
+
+
+def capture_start_pose(arm_stub, arm_pb2):
+    """Capture the EE pose at the start of an episode for relative computation."""
+    arm_state = arm_stub.GetArmState(arm_pb2.GetArmStateRequest())
+    start_pos = np.array([arm_state.x, arm_state.y, arm_state.z], dtype=np.float32)
+    start_r6d = np.array(list(arm_state.r6d), dtype=np.float32)
+    start_rot_matrix = rotation_6d_to_rotation_matrix_numpy(start_r6d.reshape(1, 6))[0]
+    return start_pos, start_rot_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -136,81 +153,31 @@ ACTION_NAMES = [
     "proximal",
     "distal",
 ]
-GRIPPER_NAMES = ["proximal", "distal"]
 
 
-def debug_log(
-    step: int,
-    state: np.ndarray,
-    action: np.ndarray,
-    delta_pos: np.ndarray,
-    delta_rot: np.ndarray,
-    gripper_goal: np.ndarray,
-    dataset_stats: dict | None = None,
-):
+def debug_log(step: int, state: np.ndarray, state_names: list, action: np.ndarray):
     """Print detailed state/action info for debugging."""
-    print(f"\n{'=' * 70}")
+    print(f"\n{'=' * 60}")
     print(f"  STEP {step}")
-    print(f"{'=' * 70}")
+    print(f"{'=' * 60}")
 
-    print("\n  Observation state (2D gripper):")
-    for i, name in enumerate(GRIPPER_NAMES):
-        val = state[i]
-        line = f"    {name:10s}: {val:+.6f}"
-        if dataset_stats and name in dataset_stats:
-            mn, mx = dataset_stats[name]
-            if val < mn or val > mx:
-                line += f"  *** OUT OF RANGE [{mn:+.4f}, {mx:+.4f}] ***"
-            else:
-                frac = (val - mn) / (mx - mn + 1e-12)
-                bar = "=" * int(frac * 20) + " " * (20 - int(frac * 20))
-                line += f"  [{bar}] ({frac * 100:.0f}%)"
-        print(line)
+    print(f"\n  Observation state ({len(state)}D):")
+    for i, name in enumerate(state_names):
+        print(f"    {name:12s}: {state[i]:+.6f}")
 
-    print("\n  Predicted action (11D deltas + gripper):")
+    print(f"\n  Predicted action ({len(action)}D):")
     for i, name in enumerate(ACTION_NAMES):
         print(f"    {name:10s}: {action[i]:+.6f}")
 
-    print(f"\n  Position delta: [{delta_pos[0]:+.6f}, {delta_pos[1]:+.6f}, {delta_pos[2]:+.6f}]")
-    print(
-        f"  Rotation delta: [{delta_rot[0]:+.4f}, {delta_rot[1]:+.4f}, {delta_rot[2]:+.4f}, "
-        f"{delta_rot[3]:+.4f}, {delta_rot[4]:+.4f}, {delta_rot[5]:+.4f}]"
-    )
-    print(f"  Gripper goal:   [{gripper_goal[0]:+.4f}, {gripper_goal[1]:+.4f}]")
-
-    pos_magnitude = np.linalg.norm(delta_pos)
-    print(f"  Delta pos magnitude: {pos_magnitude * 1000:.2f} mm")
+    delta_mm = np.linalg.norm(action[:3]) * 1000
+    print(f"\n  Delta pos magnitude: {delta_mm:.2f} mm")
 
 
 def debug_show_image(image_rgb: np.ndarray, step: int):
-    """Show the camera image that the policy sees (with step overlay)."""
     img_display = image_rgb.copy()
-    # Add step counter overlay
     cv2.putText(img_display, f"Step {step}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-    # Show in BGR for cv2
     cv2.imshow("Policy Camera Input", cv2.cvtColor(img_display, cv2.COLOR_RGB2BGR))
     cv2.waitKey(1)
-
-
-def load_dataset_stats_for_debug(checkpoint_path: str) -> dict:
-    """Load state min/max from the preprocessor stats for range checking."""
-    from pathlib import Path
-
-    from safetensors.torch import load_file
-
-    stats_file = Path(checkpoint_path) / "policy_preprocessor_step_4_normalizer_processor.safetensors"
-    if not stats_file.exists():
-        return {}
-
-    stats = load_file(stats_file)
-    result = {}
-    state_min = stats.get("observation.state/min")
-    state_max = stats.get("observation.state/max")
-    if state_min is not None and state_max is not None:
-        for i, name in enumerate(GRIPPER_NAMES):
-            if i < len(state_min):
-                result[name] = (state_min[i].item(), state_max[i].item())
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -248,39 +215,59 @@ def main():
     policy = DiffusionPolicy.from_pretrained(args.checkpoint)
     policy.to(device)
     policy.eval()
-
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
 
-    action_dim = policy.config.action_feature.shape[0]
+    # Auto-detect state mode from the checkpoint
+    state_dim = policy.config.robot_state_feature.shape[0]
+    use_relative_proprio = state_dim > 2
+    state_names = (
+        [
+            "dx_start",
+            "dy_start",
+            "dz_start",
+            "r6d_rel_0",
+            "r6d_rel_1",
+            "r6d_rel_2",
+            "r6d_rel_3",
+            "r6d_rel_4",
+            "r6d_rel_5",
+            "proximal",
+            "distal",
+        ]
+        if use_relative_proprio
+        else ["proximal", "distal"]
+    )
+
     logger.info(
-        f"Policy: action_dim={action_dim}, "
-        f"n_action_steps={policy.config.n_action_steps}, "
-        f"relative_actions={policy.config.use_relative_actions}"
+        f"Policy: action_dim={policy.config.action_feature.shape[0]}, "
+        f"state_dim={state_dim} ({'relative proprio' if use_relative_proprio else 'gripper only'}), "
+        f"n_action_steps={policy.config.n_action_steps}"
     )
 
     # ---- Connect to simulator gRPC services ----
-    # Requires: pip install openarm-gripette-simu (or uv pip install -e <path>)
-    # The simulator package provides the gRPC proto stubs.
     from openarm_gripette_simu.proto import arm_pb2, arm_pb2_grpc, gripper_pb2, gripper_pb2_grpc
 
-    logger.info(f"Connecting to ArmService at {args.arm_addr}")
     arm_channel = grpc.insecure_channel(args.arm_addr)
     arm_stub = arm_pb2_grpc.ArmServiceStub(arm_channel)
-
-    logger.info(f"Connecting to GripperService at {args.gripper_addr}")
     gripper_channel = grpc.insecure_channel(args.gripper_addr)
     gripper_stub = gripper_pb2_grpc.GripperServiceStub(gripper_channel)
 
-    # Ping both services to verify connection
-    arm_ping = arm_stub.Ping(arm_pb2.ArmPingRequest())
-    logger.info(f"ArmService: {arm_ping.status} (uptime: {arm_ping.uptime_seconds:.1f}s)")
+    arm_stub.Ping(arm_pb2.ArmPingRequest())
+    gripper_stub.Ping(gripper_pb2.PingRequest())
+    logger.info("Connected to simulator")
 
-    gripper_ping = gripper_stub.Ping(gripper_pb2.PingRequest())
-    logger.info(f"GripperService: {gripper_ping.status} (uptime: {gripper_ping.uptime_seconds:.1f}s)")
-
-    # ---- Start camera stream reader ----
-    camera_reader = CameraStreamReader(gripper_stub)
+    # ---- Start camera stream ----
+    camera_reader = CameraStreamReader(gripper_stub, gripper_pb2)
     camera_reader.start()
+
+    # ---- Capture start pose (for relative proprioception) ----
+    start_pos, start_rot_matrix = None, None
+    if use_relative_proprio:
+        start_pos, start_rot_matrix = capture_start_pose(arm_stub, arm_pb2)
+        logger.info(f"Captured start pose: pos=[{start_pos[0]:.3f}, {start_pos[1]:.3f}, {start_pos[2]:.3f}]")
+
+    if args.no_send:
+        logger.info("NO_SEND mode: commands will NOT be sent to the robot")
 
     # ---- Control loop ----
     dt = 1.0 / args.fps
@@ -288,60 +275,51 @@ def main():
     step_count = 0
     policy.reset()
 
-    # Load dataset stats for range-checking in debug mode
-    dataset_stats = load_dataset_stats_for_debug(args.checkpoint) if args.debug else {}
-    if args.debug and dataset_stats:
-        logger.info(f"Debug mode: loaded state range stats ({len(dataset_stats)} dims)")
-    if args.no_send:
-        logger.info("NO_SEND mode: commands will NOT be sent to the robot")
-
     logger.info(f"Running for {args.duration}s at {args.fps} Hz")
 
     try:
         while (time.time() - start_time) < args.duration:
             loop_start = time.perf_counter()
 
-            # --- 1. Get current state ---
-            # Gripper + camera from the streaming thread
+            # --- 1. Get observations ---
             camera_image, gripper_joints = camera_reader.get_latest()
 
-            # --- 2. Build observation ---
-            # observation.state = gripper only (2D) — no absolute position
-            state = gripper_joints  # [proximal, distal]
+            if use_relative_proprio:
+                arm_state = arm_stub.GetArmState(arm_pb2.GetArmStateRequest())
+                state = compute_relative_state(arm_state, gripper_joints, start_pos, start_rot_matrix)
+            else:
+                state = gripper_joints  # 2D
 
-            # --- 3. Build policy input tensors ---
+            # --- 2. Build policy input ---
             state_tensor = torch.from_numpy(state).float()
             image_tensor = torch.from_numpy(camera_image).float() / 255.0
-            image_tensor = image_tensor.permute(2, 0, 1).contiguous()  # (H,W,C) -> (C,H,W)
+            image_tensor = image_tensor.permute(2, 0, 1).contiguous()
 
             batch = {
                 "observation.state": state_tensor.unsqueeze(0).to(device),
                 "observation.images.cam0": image_tensor.unsqueeze(0).to(device),
             }
 
-            # --- 4. Preprocess -> Policy -> Postprocess ---
-            # The model outputs raw deltas (pre-computed in dataset, no RelativeActionsProcessorStep)
+            # --- 3. Preprocess -> Policy -> Postprocess ---
             batch = preprocessor(batch)
             with torch.no_grad():
                 action = policy.select_action(batch)
             action = postprocessor(action)
 
-            # --- 5. Extract deltas ---
+            # --- 4. Extract deltas ---
             action_np = action.squeeze(0).cpu().numpy()
-
-            # Action is already deltas: [dx, dy, dz, dr6d_0..5, proximal, distal]
             delta_pos = action_np[:3]
             delta_rot_6d = action_np[3:9]
-            gripper_goal = action_np[9:]  # absolute gripper targets
+            gripper_goal = action_np[9:]
 
-            # --- 6. Debug inspection ---
+            # --- 5. Debug ---
             if args.debug:
-                debug_log(step_count, state, action_np, delta_pos, delta_rot_6d, gripper_goal, dataset_stats)
+                debug_log(step_count, state, state_names, action_np)
                 debug_show_image(camera_image, step_count)
 
-            # --- 7. Send commands (unless --no_send) ---
+            # --- 6. Send commands ---
             if not args.no_send:
-                arm_response = arm_stub.SendCartesianDelta(
+                arm_stub.SendCartesianDelta(
                     arm_pb2.CartesianDelta(
                         dx=float(delta_pos[0]),
                         dy=float(delta_pos[1]),
@@ -349,10 +327,6 @@ def main():
                         dr6d=delta_rot_6d.tolist(),
                     )
                 )
-
-                if not arm_response.success:
-                    logger.warning(f"Arm command failed: {arm_response.error}")
-
                 gripper_stub.SendMotorCommand(
                     gripper_pb2.MotorCommand(
                         motor1_goal=float(gripper_goal[0]),
@@ -368,25 +342,19 @@ def main():
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-            # Periodic status log (non-debug mode)
             if not args.debug and step_count % 10 == 0:
                 actual_fps = 1.0 / max(time.perf_counter() - loop_start, 1e-6)
                 delta_mm = np.linalg.norm(delta_pos) * 1000
-                logger.info(
-                    f"Step {step_count:>5d} | "
-                    f"FPS: {actual_fps:5.1f} | "
-                    f"delta: [{delta_pos[0]:+.4f}, {delta_pos[1]:+.4f}, {delta_pos[2]:+.4f}] "
-                    f"({delta_mm:.1f}mm)"
-                )
+                logger.info(f"Step {step_count:>5d} | FPS: {actual_fps:5.1f} | delta: {delta_mm:.1f}mm")
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
         camera_reader.stop()
-        arm_channel.close()
-        gripper_channel.close()
         if args.debug:
             cv2.destroyAllWindows()
+        arm_channel.close()
+        gripper_channel.close()
         logger.info(f"Done. Executed {step_count} steps in {time.time() - start_time:.1f}s")
 
 

@@ -1,31 +1,28 @@
 """Convert Grabette dataset for diffusion policy training.
 
-Transforms the dataset to match the UMI approach:
+Transforms the dataset:
   1. Converts rotation from axis-angle (3D) to 6D continuous representation.
   2. Computes delta actions: action[t] = pose[t+1] - pose[t] for position/rotation,
      gripper stays absolute.
-  3. Sets observation.state to gripper joints only (2D) — the model should NOT see
-     absolute position (it's in an arbitrary SLAM reference frame).
+  3. Builds observation.state depending on --proprioception mode:
 
-Before:
-  observation.state = [x, y, z, ax, ay, az, proximal, distal]  (8D absolute)
-  action            = [x, y, z, ax, ay, az, proximal, distal]  (8D absolute)
+     --proprioception none (default):
+       observation.state = [proximal, distal]  (2D)
+       Model sees camera + gripper only. Simplest approach.
 
-After:
-  observation.state = [proximal, distal]                                           (2D)
-  action            = [dx, dy, dz, dr6d_0..5, proximal, distal]                  (11D)
-                       ^^^^^^^^^^^^^^^^^^^^^^^^                  ^^^^^^^^^^^^^^^
-                       deltas (pose[t+1] - pose[t])             absolute gripper
-
-Why:
-  - The SLAM reference frame has an arbitrary origin — absolute position is meaningless.
-  - The model gets spatial info from the camera image, not from position numbers.
-  - Delta actions are origin-invariant.
-  - 6D rotation is continuous (no singularities unlike axis-angle).
+     --proprioception relative:
+       observation.state = [dx_start, dy_start, dz_start, r6d_rel_0..5, proximal, distal]  (11D)
+       Includes position and rotation relative to episode start (UMI approach).
+       Frame-independent proprioception — the model knows how far it moved/rotated.
 
 Usage:
+  # Gripper-only state (2D):
   uv run python examples/openarm_gripette/convert_dataset.py \\
       --repo_id SteveNguyen/Grabette_redcube_quest
+
+  # With relative proprioception (11D, UMI-style):
+  uv run python examples/openarm_gripette/convert_dataset.py \\
+      --repo_id SteveNguyen/Grabette_redcube_quest --proprioception relative
 """
 
 import argparse
@@ -39,7 +36,11 @@ import pyarrow.parquet as pq
 import torch
 
 from lerobot.datasets import LeRobotDataset
-from lerobot.utils.rotation import rotvec_to_rotation_6d
+from lerobot.utils.rotation import (
+    rotation_6d_to_rotation_matrix_numpy,
+    rotation_matrix_to_rotation_6d_numpy,
+    rotvec_to_rotation_6d,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,20 @@ ACTION_NAMES = [
     "proximal",
     "distal",
 ]
-STATE_NAMES = ["proximal", "distal"]
+STATE_NAMES_NONE = ["proximal", "distal"]
+STATE_NAMES_RELATIVE = [
+    "dx_start",
+    "dy_start",
+    "dz_start",
+    "r6d_rel_0",
+    "r6d_rel_1",
+    "r6d_rel_2",
+    "r6d_rel_3",
+    "r6d_rel_4",
+    "r6d_rel_5",
+    "proximal",
+    "distal",
+]
 
 
 def pose_8d_to_11d(data_8d: np.ndarray) -> np.ndarray:
@@ -97,19 +111,63 @@ def compute_delta_actions(poses_11d: np.ndarray, episode_indices: np.ndarray) ->
     actions = np.zeros((n, 11), dtype=np.float32)
 
     # Position + rotation deltas (dims 0-8)
-    # Shift by 1: delta[t] = pose[t+1] - pose[t]
     actions[:-1, :9] = poses_11d[1:, :9] - poses_11d[:-1, :9]
 
-    # Zero out deltas at episode boundaries (last frame of each episode)
+    # Zero out deltas at episode boundaries
     ep_change = np.where(episode_indices[1:] != episode_indices[:-1])[0]
     actions[ep_change, :9] = 0.0
-    # Last frame of the whole dataset
     actions[-1, :9] = 0.0
 
-    # Gripper: absolute values (dims 9-10), taken from current frame
+    # Gripper: absolute values (dims 9-10)
     actions[:, 9:] = poses_11d[:, 9:]
 
     return actions
+
+
+def compute_relative_to_start_state(poses_11d: np.ndarray, episode_indices: np.ndarray) -> np.ndarray:
+    """Compute position and rotation relative to episode start.
+
+    For each frame, computes:
+      - Position: pos[t] - pos[episode_start]
+      - Rotation: R[t] @ R[episode_start]^{-1}, encoded as 6D
+
+    Args:
+        poses_11d: (N, 11) absolute poses [x, y, z, r6d_0..5, proximal, distal]
+        episode_indices: (N,) episode index per frame
+
+    Returns:
+        (N, 11) relative state [dx_start, dy_start, dz_start, r6d_rel_0..5, proximal, distal]
+    """
+    n = len(poses_11d)
+    relative_state = np.zeros((n, 11), dtype=np.float32)
+
+    # Find the start index of each episode
+    unique_eps = np.unique(episode_indices)
+    ep_start_idx = {}
+    for ep in unique_eps:
+        ep_start_idx[ep] = np.where(episode_indices == ep)[0][0]
+
+    for i in range(n):
+        ep = episode_indices[i]
+        start_i = ep_start_idx[ep]
+
+        # Position relative to episode start
+        relative_state[i, :3] = poses_11d[i, :3] - poses_11d[start_i, :3]
+
+        # Rotation relative to episode start: R_rel = R_current @ R_start^{-1}
+        r6d_current = poses_11d[i, 3:9]
+        r6d_start = poses_11d[start_i, 3:9]
+
+        r_current = rotation_6d_to_rotation_matrix_numpy(r6d_current.reshape(1, 6))[0]
+        r_start = rotation_6d_to_rotation_matrix_numpy(r6d_start.reshape(1, 6))[0]
+        r_relative = r_current @ r_start.T  # R_current @ R_start^{-1}
+
+        relative_state[i, 3:9] = rotation_matrix_to_rotation_6d_numpy(r_relative.reshape(1, 3, 3))[0]
+
+    # Gripper: absolute values
+    relative_state[:, 9:] = poses_11d[:, 9:]
+
+    return relative_state
 
 
 def parse_args():
@@ -120,12 +178,25 @@ def parse_args():
         default="SteveNguyen/Grabette_redcube_quest",
         help="LeRobot dataset repo ID",
     )
+    parser.add_argument(
+        "--proprioception",
+        type=str,
+        choices=["none", "relative"],
+        default="none",
+        help="State mode: 'none' = gripper only (2D), 'relative' = pose relative to episode start (11D)",
+    )
     return parser.parse_args()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
+
+    use_relative = args.proprioception == "relative"
+    state_names = STATE_NAMES_RELATIVE if use_relative else STATE_NAMES_NONE
+    state_dim = len(state_names)
+
+    logger.info(f"Proprioception mode: {args.proprioception} ({state_dim}D state)")
 
     ds = LeRobotDataset(args.repo_id)
     root = Path(ds.root)
@@ -140,37 +211,40 @@ def main():
     for pf in parquet_files:
         table = pq.read_table(pf)
 
-        # Read the original 8D action column (= absolute pose at each frame)
+        # Read the original action column (= absolute pose at each frame)
         action_col = table.column("action")
-        poses_8d = np.array(action_col.to_pylist(), dtype=np.float32)
+        poses_raw = np.array(action_col.to_pylist(), dtype=np.float32)
 
-        if poses_8d.shape[1] == 11:
-            logger.info(f"  {pf.name}: already 11D, checking if deltas are computed...")
-            # Check if this looks like deltas (mean ~0 for position dims) or absolute
-            pos_mean = np.abs(poses_8d[:, :3].mean(axis=0))
-            if np.all(pos_mean < 0.01):
-                logger.info(f"  {pf.name}: looks like deltas already, skipping")
-                continue
-            poses_11d = poses_8d
-        elif poses_8d.shape[1] == 8:
-            # Convert axis-angle to 6D rotation
-            poses_11d = pose_8d_to_11d(poses_8d)
+        # Convert to 11D if still 8D
+        if poses_raw.shape[1] == 8:
+            poses_11d = pose_8d_to_11d(poses_raw)
             logger.info(f"  {pf.name}: converted rotation 8D -> 11D")
+        elif poses_raw.shape[1] == 11:
+            # Check if this is already deltas or still absolute
+            pos_mean = np.abs(poses_raw[:, :3].mean(axis=0))
+            if np.all(pos_mean < 0.01):
+                logger.warning(f"  {pf.name}: appears to already be deltas, re-run on original data")
+                continue
+            poses_11d = poses_raw
         else:
-            raise ValueError(f"Unexpected action dim: {poses_8d.shape[1]}")
+            raise ValueError(f"Unexpected action dim: {poses_raw.shape[1]}")
 
-        # Episode indices for boundary detection
+        # Episode indices
         episode_indices = np.array(table.column("episode_index").to_pylist())
 
         # Compute delta actions
         delta_actions = compute_delta_actions(poses_11d, episode_indices)
         logger.info(
-            f"  {pf.name}: computed delta actions "
-            f"(pos delta mean magnitude: {np.linalg.norm(delta_actions[:, :3], axis=1).mean() * 1000:.2f} mm)"
+            f"  {pf.name}: delta actions "
+            f"(mean pos delta: {np.linalg.norm(delta_actions[:, :3], axis=1).mean() * 1000:.2f} mm)"
         )
 
-        # Observation state = gripper only (dims 9-10 of the 11D pose)
-        gripper_state = poses_11d[:, 9:]  # (N, 2) — proximal, distal
+        # Compute observation state
+        if use_relative:
+            obs_state = compute_relative_to_start_state(poses_11d, episode_indices)
+            logger.info(f"  {pf.name}: computed relative-to-start state (11D)")
+        else:
+            obs_state = poses_11d[:, 9:]  # gripper only (2D)
 
         # Rebuild table
         df_dict = {}
@@ -178,13 +252,12 @@ def main():
             if col == "action":
                 df_dict[col] = pa.array(delta_actions.tolist(), type=pa.list_(pa.float32()))
             elif col == "observation.state":
-                df_dict[col] = pa.array(gripper_state.tolist(), type=pa.list_(pa.float32()))
+                df_dict[col] = pa.array(obs_state.tolist(), type=pa.list_(pa.float32()))
             else:
                 df_dict[col] = table.column(col)
 
-        # Add observation.state if it didn't exist
         if "observation.state" not in table.column_names:
-            df_dict["observation.state"] = pa.array(gripper_state.tolist(), type=pa.list_(pa.float32()))
+            df_dict["observation.state"] = pa.array(obs_state.tolist(), type=pa.list_(pa.float32()))
 
         new_table = pa.table(df_dict)
         pq.write_table(new_table, pf)
@@ -195,22 +268,20 @@ def main():
     with open(info_path) as f:
         info = json.load(f)
 
-    info["features"]["action"] = {
-        "dtype": "float32",
-        "shape": [11],
-        "names": ACTION_NAMES,
-    }
+    info["features"]["action"] = {"dtype": "float32", "shape": [11], "names": ACTION_NAMES}
     info["features"]["observation.state"] = {
         "dtype": "float32",
-        "shape": [2],
-        "names": STATE_NAMES,
+        "shape": [state_dim],
+        "names": state_names,
     }
 
     with open(info_path, "w") as f:
         json.dump(info, f, indent=4)
-    logger.info("Updated info.json: action=11D (deltas), observation.state=2D (gripper)")
+    logger.info(
+        f"Updated info.json: action=11D (deltas), observation.state={state_dim}D ({args.proprioception})"
+    )
 
-    # --- 3. Recompute stats (no relative_action flag — deltas are pre-computed) ---
+    # --- 3. Recompute stats ---
     logger.info("Recomputing stats...")
     from lerobot.datasets.dataset_tools import recompute_stats
 
@@ -221,34 +292,37 @@ def main():
     logger.info("\n=== Verification ===")
     ds_final = LeRobotDataset(args.repo_id, episodes=[0])
 
-    logger.info(f"observation.state shape: {ds_final.meta.features['observation.state']['shape']}")
-    logger.info(f"observation.state names: {ds_final.meta.features['observation.state']['names']}")
-    logger.info(f"action shape: {ds_final.meta.features['action']['shape']}")
-    logger.info(f"action names: {ds_final.meta.features['action']['names']}")
+    logger.info(
+        f"observation.state: shape={ds_final.meta.features['observation.state']['shape']}, "
+        f"names={ds_final.meta.features['observation.state']['names']}"
+    )
+    logger.info(
+        f"action: shape={ds_final.meta.features['action']['shape']}, "
+        f"names={ds_final.meta.features['action']['names']}"
+    )
 
     sample = ds_final[50]
+    state = sample["observation.state"].tolist()
     logger.info("\nSample frame 50:")
-    logger.info(f"  observation.state (gripper): {sample['observation.state'].tolist()}")
+    logger.info(f"  observation.state ({state_dim}D):")
+    for n, v in zip(state_names, state, strict=True):
+        logger.info(f"    {n:12s}: {v:+.6f}")
 
     action = sample["action"].tolist()
-    logger.info("  action (11D deltas + gripper):")
+    logger.info("  action (11D):")
     for n, v in zip(ACTION_NAMES, action, strict=True):
         logger.info(f"    {n:8s}: {v:+.6f}")
 
-    # Sanity: position deltas should be small (mm scale at 50fps)
-    pos_delta = np.array(action[:3])
-    logger.info(
-        f"\n  Position delta magnitude: {np.linalg.norm(pos_delta) * 1000:.2f} mm (should be ~1-5 mm)"
-    )
+    if use_relative:
+        # Frame 0 of episode should have zero relative pose
+        sample0 = ds_final[0]
+        state0 = sample0["observation.state"].tolist()
+        logger.info("\n  Frame 0 state (should be ~0 for pose dims, nonzero for gripper):")
+        for n, v in zip(state_names, state0, strict=True):
+            logger.info(f"    {n:12s}: {v:+.6f}")
 
-    stats_path = root / "meta" / "stats.json"
-    with open(stats_path) as f:
-        stats = json.load(f)
-    logger.info("\n  Action stats (should all be delta-scale):")
-    for i, n in enumerate(ACTION_NAMES):
-        mn = stats["action"]["min"][i]
-        mx = stats["action"]["max"][i]
-        logger.info(f"    {n:8s}: min={mn:+.6f}, max={mx:+.6f}")
+    pos_delta = np.array(action[:3])
+    logger.info(f"\n  Position delta magnitude: {np.linalg.norm(pos_delta) * 1000:.2f} mm")
 
     logger.info("\nConversion complete!")
 
