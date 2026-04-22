@@ -142,8 +142,10 @@ examples/openarm_gripette/
 # Base LeRobot + diffusion + training extras (includes wandb, matplotlib)
 uv sync --locked --extra diffusion --extra training --extra dataset
 
-# For real robot deployment (placo FK/IK)
-uv sync --locked --extra kinematics
+# For real robot deployment:
+#   kinematics -> placo (FK/IK)
+#   openarms   -> Damiao motor driver + python-can (CAN bus)
+uv sync --locked --extra kinematics --extra openarms
 
 # For simulator inference: install the simulator package as editable
 uv pip install -e /path/to/openarm_gripette_simu
@@ -345,37 +347,58 @@ The `--debug` flag shows the camera feed and logs detailed state/action values. 
 
 There are two ways to run the policy on the real robot:
 
-#### Option A (recommended): gRPC server with simulator-compatible API
+#### Option A (recommended): two gRPC servers — arm + Gripette
 
-Start a gRPC server on the robot's controller PC that exposes the **exact same API
-as the simulator**. The client scripts (`eval_simulator.py`, `evaluate.py`) work
-unchanged — just point them at the robot's IP address.
+The Gripette has **its own gRPC service** exposing the exact same API as
+`gripper.proto` (camera stream + gripper motors). We complement it with a small
+gRPC server that controls the arm via CAN and exposes the same `ArmService` API
+as the simulator. The eval client connects to both endpoints.
+
+```
+┌──────────────────┐         ┌─────────────────────────────┐
+│  Inference PC    │         │       Robot controller PC    │
+│  (GPU)           │         │                              │
+│                  │         │  grpc_server_real.py         │
+│  eval_simulator  │─ArmSvc─►│  (ArmService on port 50052) │
+│      .py         │         │       │                      │
+│                  │         │       ▼ CAN bus              │
+│                  │         │  [ OpenArm 7-DOF arm ]       │
+│                  │         │                              │
+│                  │         │  (Gripette controller)       │
+│                  │─Grip───►│  GripperService on port X    │
+│                  │         │  Camera + 2-DOF gripper      │
+└──────────────────┘         └─────────────────────────────┘
+```
 
 ```bash
-# On the robot controller machine:
+# On the robot controller machine: start the arm-only gRPC server
 uv run python examples/openarm_gripette/grpc_server_real.py \
-    --can_port can0 --side right \
-    --camera_index /dev/video0
+    --can_port can0 --side right --arm_port 50052
 
-# On the inference machine (can be the same machine or a separate GPU box):
+# The Gripette's gRPC service is already running (on <gripette-ip>:<gripette-port>)
+# — it ships with the Gripette.
+
+# On the inference machine:
 uv run python examples/openarm_gripette/set_arm_pose.py \
     --arm_addr <robot-ip>:50052 \
     --joints_deg 0 0 0 90 0 0 0             # move to a safe starting pose
 
 uv run python examples/openarm_gripette/eval_simulator.py \
     --checkpoint outputs/gripette/run_001/best \
-    --arm_addr <robot-ip>:50052 --gripper_addr <robot-ip>:50051 \
+    --arm_addr <robot-ip>:50052 \
+    --gripper_addr <gripette-ip>:<gripette-port> \
     --duration 30
 ```
 
 Why this is clean:
 
 - Same client code for sim and real — no risk of "it worked in sim but the real-robot
-  script has a subtle bug"
-- Server-side FK/IK uses the same `Kinematics` class and URDF as the simulator
-- Decouples GPU (for inference) from the robot controller
-- `set_arm_pose.py` uses the same `Reset` RPC to move smoothly to a known configuration
-  before each run
+  script has a subtle bug".
+- Arm server uses the same `Kinematics` class and URDF as the simulator for bit-for-bit
+  FK/IK compatibility.
+- The Gripette already speaks the exact gripper API — no translation needed.
+- Decouples GPU (for inference) from the robot controller.
+- `set_arm_pose.py` uses the `Reset` RPC (smooth interpolation) to home the arm before runs.
 
 #### Option B: Direct deployment (no gRPC server)
 
