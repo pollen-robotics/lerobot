@@ -97,6 +97,17 @@ def parse_args():
         default=["observation.images.cam0"],
         help="Camera feature keys to use as input (others are excluded)",
     )
+    parser.add_argument(
+        "--push_to_hub",
+        type=str,
+        default=None,
+        help="HuggingFace Hub repo ID to push final + best checkpoints to (e.g. 'user/gripette_v1')",
+    )
+    parser.add_argument(
+        "--hub_private",
+        action="store_true",
+        help="Make the HuggingFace Hub repo private (default: public)",
+    )
     return parser.parse_args()
 
 
@@ -355,12 +366,38 @@ def main():
 
     # ---- Save final checkpoint ----
     # This saves the model weights, config, and processor pipelines.
-    # The processors include the RelativeActionsProcessorStep config and normalization
-    # stats, so they are self-contained for deployment.
+    # The processors are self-contained (include normalization stats).
     policy.save_pretrained(output_dir)
     preprocessor.save_pretrained(output_dir)
     postprocessor.save_pretrained(output_dir)
     print(f"\nTraining complete. Model saved to {output_dir}")
+
+    # ---- Push to HuggingFace Hub ----
+    if args.push_to_hub is not None:
+        final_repo = args.push_to_hub
+        best_repo = f"{args.push_to_hub}-best"
+        print("\nPushing to HuggingFace Hub:")
+        print(f"  final checkpoint  -> {final_repo}")
+        print(f"  best checkpoint   -> {best_repo}")
+
+        # Push the final checkpoint
+        policy.push_to_hub(final_repo, private=args.hub_private)
+        preprocessor.push_to_hub(final_repo, private=args.hub_private)
+        postprocessor.push_to_hub(final_repo, private=args.hub_private)
+
+        # Push the best checkpoint (if it exists — training may have stopped before any eval)
+        best_dir = output_dir / "best"
+        if best_dir.exists():
+            best_policy = DiffusionPolicy.from_pretrained(best_dir)
+            best_pre, best_post = make_pre_post_processors(best_policy.config, pretrained_path=best_dir)
+            best_policy.push_to_hub(best_repo, private=args.hub_private)
+            best_pre.push_to_hub(best_repo, private=args.hub_private)
+            best_post.push_to_hub(best_repo, private=args.hub_private)
+            print(f"  best_val_loss:    {best_val_loss:.4f}")
+
+        print("\nTo use on another machine:")
+        print(f"  --checkpoint {best_repo}   (recommended, lowest val_loss)")
+        print(f"  --checkpoint {final_repo}  (final step)")
 
     if use_wandb:
         wandb.finish()
