@@ -25,12 +25,42 @@ import argparse
 from pathlib import Path
 
 import torch
+import torchvision.transforms as T
 
 from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.diffusion import DiffusionConfig, DiffusionPolicy
 from lerobot.utils.feature_utils import dataset_to_policy_features
+
+
+def apply_color_jitter(batch: dict, image_keys: list[str], jitter: T.ColorJitter) -> dict:
+    """Apply color jitter to image tensors in the batch (training-only augmentation).
+
+    Random per-batch brightness / contrast / saturation / hue perturbations.
+    Applied in-place on the image tensors so the batch dict is returned unchanged
+    except for the jittered images.
+
+    Called BEFORE the preprocessor so normalization stats still apply correctly.
+    The jittered image is what reaches the vision encoder during training.
+    At inference (in eval scripts) this function is never called — checkpoint
+    is unchanged. Matches UMI's approach (brightness=0.3, contrast=0.4,
+    saturation=0.5, hue=0.08).
+    """
+    for key in image_keys:
+        if key not in batch:
+            continue
+        img = batch[key]
+        # Image shape from the dataloader: (B, T, C, H, W) because of n_obs_steps>1.
+        # ColorJitter expects (..., C, H, W) — it handles batched inputs directly.
+        # Flatten batch+time dims so jitter is random per-frame (not per-batch):
+        if img.ndim == 5:  # (B, T, C, H, W)
+            b, t = img.shape[:2]
+            img = jitter(img.reshape(b * t, *img.shape[2:]))
+            batch[key] = img.reshape(b, t, *img.shape[1:])
+        else:
+            batch[key] = jitter(img)
+    return batch
 
 
 def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[float]:
@@ -108,6 +138,11 @@ def parse_args():
         action="store_true",
         help="Make the HuggingFace Hub repo private (default: public)",
     )
+    parser.add_argument(
+        "--color_jitter",
+        action="store_true",
+        help="Enable color jitter augmentation during training (UMI values)",
+    )
     return parser.parse_args()
 
 
@@ -156,11 +191,13 @@ def main():
         # -- Vision encoder --
         # ResNet18 with GroupNorm + SpatialSoftmax (32 keypoints).
         # UMI uses ViT-base (CLIP pretrained), but ResNet18 is lighter and faster.
-        # Images resized to 224x224 (standard for pretrained vision models).
-        # No cropping — resize only to preserve full field of view.
+        # Resize to a larger shape than the final crop so the random crop has headroom
+        # to pick different framings during training (matches UMI: crop_ratio=0.95).
+        # At inference the crop is always centered — deterministic behavior.
         vision_backbone="resnet18",
-        resize_shape=(224, 224),
-        crop_ratio=1.0,  # 1.0 = no crop, resize only
+        resize_shape=(236, 236),  # slightly larger so 95% crop = 224x224
+        crop_ratio=0.95,
+        crop_is_random=True,
         pretrained_backbone_weights=None,
         use_group_norm=True,
         spatial_softmax_num_keypoints=32,
@@ -264,6 +301,14 @@ def main():
     # ---- Optimizer ----
     optimizer = cfg.get_optimizer_preset().build(policy.parameters())
 
+    # ---- Color jitter augmentation (training only, not saved to checkpoint) ----
+    # UMI defaults: brightness=0.3, contrast=0.4, saturation=0.5, hue=0.08.
+    color_jitter = None
+    if args.color_jitter:
+        color_jitter = T.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5, hue=0.08)
+        image_keys = list(cfg.image_features.keys())
+        print(f"  Color jitter:     enabled on {image_keys}")
+
     # ---- Wandb ----
     use_wandb = args.wandb_project is not None
     if use_wandb:
@@ -289,6 +334,8 @@ def main():
                 "down_dims": cfg.down_dims,
                 "use_relative_actions": cfg.use_relative_actions,
                 "relative_exclude_joints": cfg.relative_exclude_joints,
+                "color_jitter": args.color_jitter,
+                "crop_ratio": cfg.crop_ratio,
                 "action_dim": cfg.action_feature.shape[0],
                 "state_dim": cfg.robot_state_feature.shape[0],
                 "cameras": args.cameras,
@@ -311,6 +358,10 @@ def main():
     done = False
     while not done:
         for batch in train_dataloader:
+            # Training-only image augmentation (BEFORE normalization in preprocessor)
+            if color_jitter is not None:
+                batch = apply_color_jitter(batch, image_keys, color_jitter)
+
             # Forward pass
             batch = preprocessor(batch)
             loss, _ = policy.forward(batch)

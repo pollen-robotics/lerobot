@@ -115,12 +115,23 @@ This same API works for:
 ```
 examples/openarm_gripette/
     README.md              # This file
+
+    # --- Dataset & training ---
     convert_dataset.py     # Transform dataset: axis-angle → 6D, compute deltas, choose proprioception
-    train.py               # Training script (with validation split + wandb)
-    evaluate.py            # Episode-based evaluation on simulator (reset between episodes)
-    eval_simulator.py      # Continuous inference on simulator (no reset)
-    eval_on_robot.py       # Deployment on real OpenArm (uses placo FK/IK directly)
-    offline_replay.py      # Diagnostic: run policy on recorded data, compare to ground truth
+    train.py               # Training script (validation split + wandb + HF Hub push)
+    push_checkpoint.py     # Push an already-trained checkpoint to HuggingFace Hub
+
+    # --- Diagnostic ---
+    offline_replay.py      # Replay recorded episodes through the policy, compare predictions vs GT
+
+    # --- Closed-loop evaluation (simulator or real robot) ---
+    eval_simulator.py      # Continuous inference via gRPC (works with sim OR real-robot server)
+    evaluate.py            # Episode-based evaluation with reset + success tracking
+    set_arm_pose.py        # Smoothly move the arm to a specified joint configuration
+
+    # --- Real robot deployment ---
+    grpc_server_real.py    # gRPC server driving a real OpenArm via CAN — same API as simulator
+    eval_on_robot.py       # Alternative: direct deployment with placo FK/IK (no gRPC server)
 ```
 
 ## Prerequisites
@@ -242,7 +253,20 @@ Key CLI arguments:
 | `--save_freq`      | 10000   | Checkpoint save every N steps                                           |
 | `--val_ratio`      | 0.1     | Fraction of episodes held out for validation                            |
 | `--cameras`        | cam0    | Which cameras to use (others filtered out)                              |
+| `--color_jitter`   | off     | Enable color jitter augmentation (UMI values) — training-only           |
 | `--wandb_project`  | None    | Wandb project name (None = disabled)                                    |
+| `--push_to_hub`    | None    | HF Hub repo ID — auto-pushes final + best checkpoints after training    |
+| `--hub_private`    | off     | Make the pushed repo private                                            |
+
+Data augmentation (always on):
+
+- **Random crop** (95% ratio): images are resized to 236x236 and randomly cropped to
+  224x224 during training; center-cropped at inference. Matches UMI.
+
+Opt-in via `--color_jitter`:
+
+- **Color jitter**: random brightness / contrast / saturation / hue perturbations on
+  training images (UMI values: 0.3/0.4/0.5/0.08). Not applied at inference.
 
 Training output:
 
@@ -257,7 +281,31 @@ step:     600 / 5000  train_loss: 0.0098  val_loss: 0.0687  best_val: 0.0523
 
 When val_loss stops improving, use `--checkpoint <output_dir>/best` for deployment.
 
-### Step 3: Test on the Simulator
+### Step 3: Diagnostic — Offline Replay
+
+Before touching any robot, verify the model learned the training distribution:
+
+```bash
+uv run python examples/openarm_gripette/offline_replay.py \
+    --checkpoint outputs/gripette/run_001/best \
+    --dataset_repo_id <YOUR_DATASET_REPO_ID> \
+    --num_episodes 5
+```
+
+This feeds recorded observations through the policy and compares predicted actions
+against ground truth. Outputs:
+
+- Per-dimension MAE
+- Plots saved to `outputs/gripette/replay/`: position / rotation / gripper,
+  predicted vs ground truth over time
+
+Interpretation:
+
+- **Good tracking** → the model learned the training data. Test closed-loop next.
+- **Poor tracking** → underfitting (more training) or data issue (check dataset).
+- **Perfect tracking (MAE << 1mm)** → overfitting. Use an earlier checkpoint.
+
+### Step 4: Closed-Loop Evaluation (Simulator)
 
 Launch the simulator in another terminal:
 
@@ -293,66 +341,104 @@ uv run python examples/openarm_gripette/eval_simulator.py \
 The `--debug` flag shows the camera feed and logs detailed state/action values. The
 `--no_send` flag lets you inspect predictions without moving the robot.
 
-### Step 4: Diagnostic — Offline Replay
+### Step 5: Deploy on Real Robot
 
-To verify the model learned the training distribution without involving the simulator:
+There are two ways to run the policy on the real robot:
+
+#### Option A (recommended): gRPC server with simulator-compatible API
+
+Start a gRPC server on the robot's controller PC that exposes the **exact same API
+as the simulator**. The client scripts (`eval_simulator.py`, `evaluate.py`) work
+unchanged — just point them at the robot's IP address.
 
 ```bash
-uv run python examples/openarm_gripette/offline_replay.py \
+# On the robot controller machine:
+uv run python examples/openarm_gripette/grpc_server_real.py \
+    --can_port can0 --side right \
+    --camera_index /dev/video0
+
+# On the inference machine (can be the same machine or a separate GPU box):
+uv run python examples/openarm_gripette/set_arm_pose.py \
+    --arm_addr <robot-ip>:50052 \
+    --joints_deg 0 0 0 90 0 0 0             # move to a safe starting pose
+
+uv run python examples/openarm_gripette/eval_simulator.py \
     --checkpoint outputs/gripette/run_001/best \
-    --dataset_repo_id <YOUR_DATASET_REPO_ID> \
-    --num_episodes 5
+    --arm_addr <robot-ip>:50052 --gripper_addr <robot-ip>:50051 \
+    --duration 30
 ```
 
-This feeds recorded observations through the policy and compares predicted actions
-against ground truth. Outputs:
+Why this is clean:
 
-- Per-dimension MAE
-- Plots saved to `outputs/gripette/replay/`:
-  - Position deltas (dx, dy, dz) predicted vs ground truth
-  - Rotation deltas (dr6d_0..5) predicted vs ground truth
-  - Gripper predicted vs ground truth
+- Same client code for sim and real — no risk of "it worked in sim but the real-robot
+  script has a subtle bug"
+- Server-side FK/IK uses the same `Kinematics` class and URDF as the simulator
+- Decouples GPU (for inference) from the robot controller
+- `set_arm_pose.py` uses the same `Reset` RPC to move smoothly to a known configuration
+  before each run
 
-If the offline replay shows poor tracking, the model hasn't learned the training data —
-more training steps, or review the dataset. If it shows good tracking but simulator
-behavior is poor, the issue is distribution shift (visual or state-space gap between
-training data and simulator).
+#### Option B: Direct deployment (no gRPC server)
 
-### Step 5: Deploy on Real Robot
+If you prefer a single-process pipeline (inference + FK/IK + CAN on the same machine):
 
 ```bash
 uv run python examples/openarm_gripette/eval_on_robot.py \
     --checkpoint outputs/gripette/run_001/best \
     --urdf path/to/openarm.urdf \
-    --can_port can0 \
-    --side right \
+    --can_port can0 --side right \
     --duration 30
 ```
 
-The real-robot script uses `placo` for FK/IK directly (no gRPC). It reads joint
-encoders, computes FK, runs the policy, runs IK, and sends joint commands via CAN bus.
+This script uses `placo` for FK/IK directly and talks to the motors via CAN — no gRPC
+hop. Simpler to debug but duplicates the logic that's in `grpc_server_real.py`.
 
-**Note**: If the simulator uses the same gRPC protocol as the real robot, you can use
-`eval_simulator.py` with the real-robot gRPC endpoint instead — it's the same API.
+### Sharing Models
+
+To share a trained model across machines, push it to the HuggingFace Hub:
+
+```bash
+# Automatic push after training
+uv run python examples/openarm_gripette/train.py \
+    --dataset_repo_id <DATASET> \
+    --push_to_hub SteveNguyen/gripette_v1 \
+    ...
+
+# Or push an already-trained checkpoint
+uv run python examples/openarm_gripette/push_checkpoint.py \
+    --checkpoint outputs/gripette/run_001/best \
+    --repo_id SteveNguyen/gripette_v1
+```
+
+On the target machine, use the Hub repo ID as the checkpoint:
+
+```bash
+uv run python examples/openarm_gripette/eval_simulator.py \
+    --checkpoint SteveNguyen/gripette_v1 \
+    --arm_addr <robot-ip>:50052 ...
+```
+
+`DiffusionPolicy.from_pretrained()` handles Hub paths transparently — no code changes
+needed. Requires `huggingface-cli login` once on the target machine (or `HF_TOKEN`
+environment variable).
 
 ## Configuration Reference
 
 ### Current DiffusionConfig
 
-| Parameter              | Value                | Notes                                      |
-| ---------------------- | -------------------- | ------------------------------------------ |
-| `n_obs_steps`          | 2                    | Past observation frames used as input      |
-| `horizon`              | 16                   | Total action trajectory length predicted   |
-| `n_action_steps`       | 8 (CLI configurable) | Actions executed before re-planning        |
-| `vision_backbone`      | `resnet18`           | With GroupNorm (not BatchNorm)             |
-| `resize_shape`         | `(224, 224)`         | Standard size for pretrained vision models |
-| `crop_ratio`           | 1.0                  | No crop — resize only                      |
-| `down_dims`            | `(256, 512, 1024)`   | U-Net channels per stage (matches UMI)     |
-| `noise_scheduler_type` | `DDIM`               | Fast inference                             |
-| `num_train_timesteps`  | 50                   | Training denoising steps                   |
-| `num_inference_steps`  | 16                   | Inference denoising steps                  |
-| `optimizer_lr`         | `3e-4`               | Learning rate (matches UMI)                |
-| `scheduler_warmup`     | 2000                 | Cosine warmup steps (matches UMI)          |
+| Parameter              | Value                | Notes                                                 |
+| ---------------------- | -------------------- | ----------------------------------------------------- |
+| `n_obs_steps`          | 2                    | Past observation frames used as input                 |
+| `horizon`              | 16                   | Total action trajectory length predicted              |
+| `n_action_steps`       | 8 (CLI configurable) | Actions executed before re-planning                   |
+| `vision_backbone`      | `resnet18`           | With GroupNorm (not BatchNorm)                        |
+| `resize_shape`         | `(236, 236)`         | Resize before random crop (UMI pattern)               |
+| `crop_ratio`           | 0.95                 | Random crop to 224x224 during training, centered eval |
+| `down_dims`            | `(256, 512, 1024)`   | U-Net channels per stage (matches UMI)                |
+| `noise_scheduler_type` | `DDIM`               | Fast inference                                        |
+| `num_train_timesteps`  | 50                   | Training denoising steps                              |
+| `num_inference_steps`  | 16                   | Inference denoising steps                             |
+| `optimizer_lr`         | `3e-4`               | Learning rate (matches UMI)                           |
+| `scheduler_warmup`     | 2000                 | Cosine warmup steps (matches UMI)                     |
 
 See `docs/umi_analysis.md` for a detailed comparison with the UMI reference
 implementation.
