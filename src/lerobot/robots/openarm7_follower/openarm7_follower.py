@@ -59,6 +59,24 @@ class OpenArm7Follower(OpenArmFollower):
         super().__init__(config)
         config.side = original_side
 
+    # -- Calibration bypass -------------------------------------------------
+    # OpenArm motor zeros live in the Damiao motor firmware (set externally
+    # via OpenArm's official calibration tool). The Damiao bus never reads
+    # the LeRobot calibration fields (homing_offset / drive_mode / range_*),
+    # so LeRobot's file-based calibration is purely vestigial for this arm.
+    # We bypass it entirely to avoid prompts and accidental zero overwrites.
+
+    @property
+    def is_calibrated(self) -> bool:
+        return True
+
+    def calibrate(self) -> None:
+        logger.info(
+            "LeRobot calibration is disabled for OpenArm7Follower. "
+            "Motor zeros are stored in firmware — use OpenArm's calibration tool "
+            "to (re)set them. No calibration file will be read or written."
+        )
+
     @check_if_not_connected
     def send_action(
         self,

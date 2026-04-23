@@ -283,7 +283,10 @@ def main():
         cameras={},  # no cameras on this driver — camera comes via Gripette's gRPC
     )
     robot = OpenArm7Follower(robot_config)
-    robot.connect()
+    # calibrate=False: the server never modifies calibration. If the firmware
+    # zeros or the calibration file need updating, run `lerobot-calibrate`
+    # explicitly before starting the server.
+    robot.connect(calibrate=False)
     logger.info("Robot connected (7-DOF arm, gripper is external)")
 
     arm_iface = ArmInterface(robot, arm_joint_map)
