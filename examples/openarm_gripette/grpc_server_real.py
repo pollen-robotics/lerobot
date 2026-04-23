@@ -146,14 +146,52 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
     accumulate on that target (not on the current FK pose), avoiding drift from
     mechanical tracking errors. After IK, the target is re-synced to the FK of
     the commanded joints so it stays within a reachable neighborhood.
+
+    Joint-space setpoint interpolation: SendCartesianDelta only computes IK and
+    writes the target into a slot. A background thread at interp_hz drives the
+    motors using an exponential approach toward that slot, filling in the time
+    between sparse policy commands with a smooth joint trajectory. This is the
+    standard fix for "smooth Cartesian in -> jerky motors out" with stiff MIT
+    gains.
     """
 
-    def __init__(self, arm: ArmInterface, kin: Kinematics, start_time: float):
+    def __init__(
+        self,
+        arm: ArmInterface,
+        kin: Kinematics,
+        start_time: float,
+        interp_hz: float = 50.0,
+        interp_alpha: float = 0.3,
+    ):
         self._arm = arm
         self._kin = kin
         self._start_time = start_time
         self._cmd_lock = threading.Lock()
+
+        # Setpoint interpolator state.
+        # `_latest_target_joints` is an atomic slot (reference assignment is
+        # atomic under the GIL); `_current_cmd_joints` is only touched by the
+        # interp thread, so it needs no lock.
+        self._interp_hz = interp_hz
+        self._interp_alpha = interp_alpha
+        self._latest_target_joints: np.ndarray | None = None
+        self._current_cmd_joints: np.ndarray | None = None
+        self._interp_enabled = True
+        self._interp_running = True
+
         self._sync_target_from_robot()
+
+        self._interp_thread = threading.Thread(target=self._interp_loop, name="ArmInterpLoop", daemon=True)
+        self._interp_thread.start()
+        logger.info(
+            f"Joint interpolator ON: {self._interp_hz:.0f} Hz, alpha={self._interp_alpha:.2f} "
+            f"(e-folding time ~{1000.0 / (self._interp_alpha * self._interp_hz):.0f} ms)"
+        )
+
+    def stop(self):
+        self._interp_running = False
+        if self._interp_thread.is_alive():
+            self._interp_thread.join(timeout=2.0)
 
     def _sync_target_from_robot(self):
         """Reset internal target from the current robot FK pose."""
@@ -161,6 +199,29 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
         tf = self._kin.forward(arm_joints)
         self._target_pos = tf[:3, 3].copy()
         self._target_r6d = rotation_matrix_to_6d(tf[:3, :3]).copy()
+
+    def _interp_loop(self):
+        """Drive motors at interp_hz with exponential approach toward latest target."""
+        period = 1.0 / self._interp_hz
+        while self._interp_running:
+            tick = time.monotonic()
+            if self._interp_enabled:
+                target = self._latest_target_joints  # atomic read (ref assignment)
+                if target is not None:
+                    if self._current_cmd_joints is None:
+                        self._current_cmd_joints = self._arm.get_positions()
+                    # next = cur + alpha * (target - cur)
+                    self._current_cmd_joints = self._current_cmd_joints + self._interp_alpha * (
+                        target - self._current_cmd_joints
+                    )
+                    try:
+                        self._arm.send_command_rad(self._current_cmd_joints)
+                    except Exception as e:
+                        logger.warning(f"Interp motor write failed: {e}")
+            elapsed = time.monotonic() - tick
+            sleep_for = period - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
     def SendCartesianDelta(self, request, context):
         try:
@@ -183,7 +244,9 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
 
                 arm_joints = self._arm.get_positions()
                 target_joints = self._kin.inverse(target_tf, current_joint_positions=arm_joints)
-                self._arm.send_command_rad(target_joints)
+
+                # Hand off to the interpolator — no direct motor write.
+                self._latest_target_joints = target_joints.copy()
 
                 achieved_tf = self._kin.forward(target_joints)
                 self._target_pos = achieved_tf[:3, 3].copy()
@@ -212,6 +275,9 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
     def Reset(self, request, context):
         """Move the arm smoothly to the home (or specified) joint configuration.
 
+        Pauses the setpoint interpolator for the duration of the linear ramp,
+        then resyncs its state to the final pose so it resumes cleanly.
+
         Cube randomization is a no-op (no physical cube); dummy cube coords are
         returned for API compatibility with the simulator.
         """
@@ -221,24 +287,31 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
             else:
                 target_joints = HOME_JOINTS_RAD.copy()
 
-            with self._cmd_lock:
-                start_joints = self._arm.get_positions()
+            self._interp_enabled = False
+            try:
+                with self._cmd_lock:
+                    start_joints = self._arm.get_positions()
 
-                num_steps = int(RESET_DURATION_S * RESET_HZ)
-                dt = 1.0 / RESET_HZ
+                    num_steps = int(RESET_DURATION_S * RESET_HZ)
+                    dt = 1.0 / RESET_HZ
 
-                logger.info(
-                    f"Reset: interpolating over {RESET_DURATION_S}s "
-                    f"from {start_joints.round(3).tolist()} to {target_joints.round(3).tolist()}"
-                )
+                    logger.info(
+                        f"Reset: interpolating over {RESET_DURATION_S}s "
+                        f"from {start_joints.round(3).tolist()} to {target_joints.round(3).tolist()}"
+                    )
 
-                for i in range(1, num_steps + 1):
-                    alpha = i / num_steps
-                    interp = start_joints * (1 - alpha) + target_joints * alpha
-                    self._arm.send_command_rad(interp)
-                    time.sleep(dt)
+                    for i in range(1, num_steps + 1):
+                        alpha = i / num_steps
+                        interp = start_joints * (1 - alpha) + target_joints * alpha
+                        self._arm.send_command_rad(interp)
+                        time.sleep(dt)
 
-                self._sync_target_from_robot()
+                    # Resync interp state so it picks up from here without a jump.
+                    self._current_cmd_joints = target_joints.copy()
+                    self._latest_target_joints = target_joints.copy()
+                    self._sync_target_from_robot()
+            finally:
+                self._interp_enabled = True
 
             return arm_pb2.ResetResponse(
                 success=True,
@@ -297,6 +370,22 @@ def parse_args():
         help="Multiplier applied to all MIT position_kd values at startup. "
         "Typically scale kd ~ sqrt(kp_scale) to preserve damping ratio; in "
         "practice leave at 1.0 first and tune from there.",
+    )
+    p.add_argument(
+        "--interp_hz",
+        type=float,
+        default=50.0,
+        help="Joint-space setpoint interpolator rate (Hz). The interpolator "
+        "thread sends MIT commands at this rate, filling in the time between "
+        "sparse Cartesian delta RPCs with a smooth joint trajectory.",
+    )
+    p.add_argument(
+        "--interp_alpha",
+        type=float,
+        default=0.3,
+        help="Exponential approach rate per interp tick: next = cur + alpha * (target - cur). "
+        "Smaller = smoother + more lag (e-folding time = 1 / (alpha * interp_hz)). "
+        "Typical range 0.1 (heavy smoothing, ~100ms lag at 50Hz) to 0.5 (light smoothing, ~40ms lag).",
     )
     p.add_argument(
         "--arm_joint_map",
@@ -363,7 +452,14 @@ def main():
     # ---- gRPC server ----
     start_time = time.monotonic()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    arm_pb2_grpc.add_ArmServiceServicer_to_server(ArmServicer(arm_iface, kin, start_time), server)
+    servicer = ArmServicer(
+        arm_iface,
+        kin,
+        start_time,
+        interp_hz=args.interp_hz,
+        interp_alpha=args.interp_alpha,
+    )
+    arm_pb2_grpc.add_ArmServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{args.arm_port}")
     server.start()
     logger.info(f"ArmService listening on port {args.arm_port}")
@@ -375,6 +471,7 @@ def main():
         logger.info("Shutting down...")
     finally:
         server.stop(grace=2.0)
+        servicer.stop()
         robot.disconnect()
         logger.info("Robot disconnected. Goodbye.")
 
