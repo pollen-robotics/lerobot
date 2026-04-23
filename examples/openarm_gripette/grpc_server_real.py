@@ -273,13 +273,31 @@ def parse_args():
     p.add_argument(
         "--max_relative_target",
         type=float,
-        default=None,
-        help="Max per-step joint motion in degrees (safety limit). When set, "
-        "send_action does an extra CAN sync_read each command — costs one full "
-        "bus transaction and contributes to packet drops. IK already clips to "
-        "joint limits; leave unset unless you specifically need the extra guard.",
+        default=8.0,
+        help="Max per-step joint motion in degrees (safety limit). Each command "
+        "then does an extra CAN sync_read to check current position — costs one "
+        "full bus transaction. Pass a large value (e.g. 180) to effectively "
+        "disable the clamp while still paying the read cost, or remove the "
+        "`max_relative_target` kwarg in the config to skip it entirely.",
     )
     p.add_argument("--arm_port", type=int, default=50052, help="gRPC listen port")
+    p.add_argument(
+        "--kp_scale",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to all MIT position_kp values at startup. "
+        "Useful for taming a stiff controller without editing the config: "
+        "0.5 halves all kp (softer tracking, smoother under sparse commands), "
+        "2.0 doubles them (stiffer).",
+    )
+    p.add_argument(
+        "--kd_scale",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to all MIT position_kd values at startup. "
+        "Typically scale kd ~ sqrt(kp_scale) to preserve damping ratio; in "
+        "practice leave at 1.0 first and tune from there.",
+    )
     p.add_argument(
         "--arm_joint_map",
         type=str,
@@ -318,6 +336,16 @@ def main():
         max_relative_target=args.max_relative_target,
         cameras={},  # no cameras on this driver — camera comes via Gripette's gRPC
     )
+    if args.kp_scale != 1.0:
+        robot_config.position_kp = [v * args.kp_scale for v in robot_config.position_kp]
+        logger.info(
+            f"Scaled MIT position_kp by {args.kp_scale}: {[round(v, 2) for v in robot_config.position_kp]}"
+        )
+    if args.kd_scale != 1.0:
+        robot_config.position_kd = [v * args.kd_scale for v in robot_config.position_kd]
+        logger.info(
+            f"Scaled MIT position_kd by {args.kd_scale}: {[round(v, 2) for v in robot_config.position_kd]}"
+        )
     robot = OpenArm7Follower(robot_config)
     # calibrate=False: the server never modifies calibration. If the firmware
     # zeros or the calibration file need updating, run `lerobot-calibrate`
