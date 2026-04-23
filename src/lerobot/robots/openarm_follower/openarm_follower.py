@@ -144,8 +144,13 @@ class OpenArmFollower(Robot):
 
         self.configure()
 
-        if self.is_calibrated:
-            self.bus.set_zero_position()
+        # Do NOT call set_zero_position() here. The Damiao motors store their
+        # zero in firmware (persistent across power cycles). Re-zeroing on every
+        # connect would silently overwrite the stored zero with whatever position
+        # the arm happens to be in at startup, making FK/IK non-reproducible.
+        # Zeros are set only during the interactive calibration flow (see
+        # calibrate() below). If a motor was replaced or lost its firmware zero,
+        # the user must re-run calibration explicitly.
 
         self.bus.enable_torque()
 
