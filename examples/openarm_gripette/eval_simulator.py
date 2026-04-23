@@ -27,6 +27,8 @@ import torch
 
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.diffusion import DiffusionPolicy
+from lerobot.policies.utils import populate_queues
+from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.rotation import (
     rotation_6d_to_rotation_matrix_numpy,
     rotation_matrix_to_rotation_6d_numpy,
@@ -137,6 +139,44 @@ def capture_start_pose(arm_stub, arm_pb2):
 
 
 # ---------------------------------------------------------------------------
+# Temporal ensembling (ACT-style)
+# ---------------------------------------------------------------------------
+
+
+class TemporalEnsembleBuffer:
+    """Rolling buffer of recent predicted action chunks + recency-weighted aggregation.
+
+    At each inference step t, push the full predicted chunk (shape [horizon, action_dim]).
+    aggregate() returns a single action for the current timestep computed as the
+    exponentially-recency-weighted average of every stored chunk's prediction for t.
+
+    Weight for a chunk of age i (0 = pushed this step) is exp(-k * i). Smaller k
+    = more uniform smoothing (more lag); larger k = weight only recent predictions
+    (less smoothing).
+    """
+
+    def __init__(self, horizon: int, k: float = 0.1):
+        self.horizon = horizon
+        self.k = k
+        # chunks[i] holds the chunk pushed at global step (self.step - 1 - i)
+        self.chunks: list[np.ndarray] = []
+
+    def push(self, chunk: np.ndarray) -> None:
+        """chunk: (horizon, action_dim) — prediction produced this step."""
+        self.chunks.insert(0, chunk.copy())
+        # Anything older than horizon has no prediction for the current step.
+        if len(self.chunks) > self.horizon:
+            self.chunks = self.chunks[: self.horizon]
+
+    def aggregate(self) -> np.ndarray:
+        """Return weighted action for the *most recent* timestep (age-0 position)."""
+        preds = np.stack([c[i] for i, c in enumerate(self.chunks)])  # (N, action_dim)
+        weights = np.exp(-self.k * np.arange(len(self.chunks)))
+        weights /= weights.sum()
+        return (preds * weights[:, None]).sum(axis=0)
+
+
+# ---------------------------------------------------------------------------
 # Debug visualization
 # ---------------------------------------------------------------------------
 
@@ -197,6 +237,29 @@ def parse_args():
     )
     p.add_argument("--debug", action="store_true", help="Show camera feed + log detailed state/action info")
     p.add_argument("--no_send", action="store_true", help="Debug only: do NOT send commands to the robot")
+    p.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=None,
+        help="Override policy.config.n_action_steps at inference time. "
+        "Smaller values re-infer more often and smooth chunk-boundary jerks "
+        "(e.g. 1 = re-infer every step). If omitted, use the checkpoint's value.",
+    )
+    p.add_argument(
+        "--temporal_ensemble",
+        action="store_true",
+        help="Enable ACT-style temporal ensembling: aggregate every step's full predicted "
+        "chunk via a recency-weighted average, producing a smoothed command trajectory. "
+        "Bypasses select_action and runs inference every control step.",
+    )
+    p.add_argument(
+        "--temporal_ensemble_k",
+        type=float,
+        default=0.1,
+        help="Weight decay for temporal ensembling: w_i = exp(-k * age). "
+        "Smaller k = more uniform averaging (heavier smoothing, more lag). "
+        "Typical range 0.01 (very smooth) -> 0.5 (light smoothing).",
+    )
     return p.parse_args()
 
 
@@ -207,7 +270,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    logging.basicConfig(level=logging.INFO)
+    # force=True: some lerobot submodules configure the root logger during import,
+    # which makes a plain basicConfig() a no-op and silences our logs.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
     device = torch.device(args.device)
 
     # ---- Load policy and processors ----
@@ -216,6 +281,13 @@ def main():
     policy.to(device)
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
+
+    # Optional override of n_action_steps at inference time (no retraining needed).
+    # Smaller values re-infer more often, eliminating chunk-boundary jerks at the
+    # cost of more GPU calls per second.
+    if args.n_action_steps is not None:
+        logger.info(f"Overriding n_action_steps: {policy.config.n_action_steps} -> {args.n_action_steps}")
+        policy.config.n_action_steps = args.n_action_steps
 
     # Auto-detect state mode from the checkpoint
     state_dim = policy.config.robot_state_feature.shape[0]
@@ -275,6 +347,19 @@ def main():
     step_count = 0
     policy.reset()
 
+    # ---- Temporal ensembling setup ----
+    ensemble: TemporalEnsembleBuffer | None = None
+    if args.temporal_ensemble:
+        # Each predicted chunk used for ensembling has length
+        # `horizon - n_obs_steps + 1` (generate_actions slices from index n_obs_steps-1).
+        effective_horizon = policy.config.horizon - policy.config.n_obs_steps + 1
+        ensemble = TemporalEnsembleBuffer(horizon=effective_horizon, k=args.temporal_ensemble_k)
+        logger.info(
+            f"Temporal ensembling ON (effective_horizon={effective_horizon}, "
+            f"k={args.temporal_ensemble_k}). "
+            f"Bypassing select_action; running inference every control step."
+        )
+
     logger.info(f"Running for {args.duration}s at {args.fps} Hz")
 
     try:
@@ -302,8 +387,38 @@ def main():
 
             # --- 3. Preprocess -> Policy -> Postprocess ---
             batch = preprocessor(batch)
-            with torch.no_grad():
-                action = policy.select_action(batch)
+            if ensemble is None:
+                # Standard path: policy manages its own internal chunk queue.
+                with torch.no_grad():
+                    action = policy.select_action(batch)
+            else:
+                # Temporal-ensembling path: generate a full chunk every step,
+                # push into the ensemble buffer, and use its recency-weighted
+                # aggregate as the current action. Unnormalization is linear,
+                # so we can ensemble in normalized space and postprocess after.
+                batch_for_policy = dict(batch)
+                # The preprocessor writes a normalized `action` placeholder
+                # (Normalizer covers both input and output features); select_action
+                # pops it before queue population, and we do the same here to
+                # avoid stuffing a None/placeholder into the ACTION deque.
+                batch_for_policy.pop(ACTION, None)
+                if policy.config.image_features:
+                    batch_for_policy[OBS_IMAGES] = torch.stack(
+                        [batch_for_policy[k] for k in policy.config.image_features], dim=-4
+                    )
+                policy._queues = populate_queues(policy._queues, batch_for_policy)
+                # generate_actions slices to n_action_steps; override temporarily
+                # so predict_action_chunk returns the remaining horizon for the ensemble.
+                saved_n_action_steps = policy.config.n_action_steps
+                policy.config.n_action_steps = policy.config.horizon - policy.config.n_obs_steps + 1
+                try:
+                    with torch.no_grad():
+                        chunk = policy.predict_action_chunk(batch_for_policy)  # (1, T, A)
+                finally:
+                    policy.config.n_action_steps = saved_n_action_steps
+                ensemble.push(chunk.squeeze(0).cpu().numpy())
+                agg_np = ensemble.aggregate()
+                action = torch.from_numpy(agg_np).float().unsqueeze(0).to(device)
             action = postprocessor(action)
 
             # --- 4. Extract deltas ---

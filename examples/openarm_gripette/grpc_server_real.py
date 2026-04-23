@@ -75,20 +75,53 @@ RAD_TO_DEG = 180.0 / np.pi
 class ArmInterface:
     """Adapter between the simulator's joint API (radians, r_arm_* names) and
     LeRobot's OpenArm7Follower (degrees, joint_1..joint_7 names).
+
+    Caches the most recent joint read with a short TTL so that GetArmState and
+    SendCartesianDelta called within the same control cycle share a single CAN
+    refresh. Without this, every inference step triggers two full refreshes
+    (one for client-side state, one for IK), doubling bus load and packet drops.
     """
 
-    def __init__(self, robot: OpenArm7Follower, arm_joint_map: dict[str, str]):
+    def __init__(
+        self,
+        robot: OpenArm7Follower,
+        arm_joint_map: dict[str, str],
+        state_cache_ttl_s: float = 0.02,
+    ):
         self._robot = robot
         self._arm_joint_map = arm_joint_map  # sim_name -> lerobot_name
         self._lerobot_arm_names = [arm_joint_map[n] for n in KIN_ARM_JOINT_NAMES]
         self._lock = threading.Lock()
+        self._state_cache_ttl = state_cache_ttl_s
+        self._cached_positions_rad: np.ndarray | None = None
+        self._cached_positions_ts: float = 0.0
 
     def get_positions(self) -> np.ndarray:
-        """Read arm joint positions in radians, in simulator order (r_arm_pitch, ...)."""
+        """Read arm joint positions in radians, in simulator order (r_arm_pitch, ...).
+
+        Returns a cached value if the last refresh is within state_cache_ttl_s.
+        """
+        now = time.monotonic()
+        if (
+            self._cached_positions_rad is not None
+            and (now - self._cached_positions_ts) < self._state_cache_ttl
+        ):
+            return self._cached_positions_rad.copy()
         with self._lock:
+            # Double-checked: another thread may have refreshed while we waited.
+            now = time.monotonic()
+            if (
+                self._cached_positions_rad is not None
+                and (now - self._cached_positions_ts) < self._state_cache_ttl
+            ):
+                return self._cached_positions_rad.copy()
             obs = self._robot.get_observation()
-        positions_deg = np.array([obs[f"{name}.pos"] for name in self._lerobot_arm_names], dtype=np.float64)
-        return positions_deg * DEG_TO_RAD
+            positions_deg = np.array(
+                [obs[f"{name}.pos"] for name in self._lerobot_arm_names], dtype=np.float64
+            )
+            self._cached_positions_rad = positions_deg * DEG_TO_RAD
+            self._cached_positions_ts = time.monotonic()
+            return self._cached_positions_rad.copy()
 
     def send_command_rad(self, joint_angles_rad: np.ndarray):
         """Send arm joint commands (radians, in simulator order)."""
@@ -240,8 +273,11 @@ def parse_args():
     p.add_argument(
         "--max_relative_target",
         type=float,
-        default=8.0,
-        help="Max per-step joint motion in degrees (safety limit)",
+        default=None,
+        help="Max per-step joint motion in degrees (safety limit). When set, "
+        "send_action does an extra CAN sync_read each command — costs one full "
+        "bus transaction and contributes to packet drops. IK already clips to "
+        "joint limits; leave unset unless you specifically need the extra guard.",
     )
     p.add_argument("--arm_port", type=int, default=50052, help="gRPC listen port")
     p.add_argument(
