@@ -35,12 +35,24 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 
 def apply_color_jitter(
-    batch: dict, image_keys: list[str], jitter: T.ColorJitter, device: torch.device
+    batch: dict,
+    image_keys: list[str],
+    jitter: T.ColorJitter,
+    device: torch.device,
+    resize_shape: tuple[int, int] | None = None,
 ) -> dict:
     """Apply color jitter to image tensors in the batch (training-only augmentation).
 
     Images are moved to ``device`` first so the jitter runs on GPU — otherwise
     the CPU jitter path dominates iteration time on a GPU-bound training loop.
+
+    If ``resize_shape`` is provided, images are resized *before* jitter. The
+    jitter's hue conversion internally allocates ~6 intermediate tensors of
+    the image size; at native 720×960 + batch 128 this peaks at ~12 GB, which
+    is enough to OOM a 32 GB GPU once the model + compile workspace is in.
+    Resizing first (e.g. to 236×236 — matching DiffusionConfig.resize_shape)
+    cuts that ~12×. The model internally resizes anyway, so this only moves
+    the resize upstream.
 
     Random per-batch brightness / contrast / saturation / hue perturbations.
     Applied in-place on the image tensors so the batch dict is returned unchanged
@@ -52,6 +64,8 @@ def apply_color_jitter(
     is unchanged. Matches UMI's approach (brightness=0.3, contrast=0.4,
     saturation=0.5, hue=0.08).
     """
+    import torch.nn.functional as F
+
     for key in image_keys:
         if key not in batch:
             continue
@@ -59,13 +73,20 @@ def apply_color_jitter(
         # takes ~microseconds; on CPU it's ~tens of ms per batch (dominating).
         img = batch[key].to(device, non_blocking=True)
         # Image shape from the dataloader: (B, T, C, H, W) because of n_obs_steps>1.
-        # ColorJitter expects (..., C, H, W) — it handles batched inputs directly.
-        # Flatten batch+time dims so jitter is random per-frame (not per-batch):
         if img.ndim == 5:  # (B, T, C, H, W)
             b, t = img.shape[:2]
-            img = jitter(img.reshape(b * t, *img.shape[2:]))
-            batch[key] = img.reshape(b, t, *img.shape[1:])
+            flat = img.reshape(b * t, *img.shape[2:])
+            if resize_shape is not None and flat.shape[-2:] != tuple(resize_shape):
+                flat = F.interpolate(
+                    flat, size=resize_shape, mode="bilinear", align_corners=False
+                )
+            flat = jitter(flat)
+            batch[key] = flat.reshape(b, t, *flat.shape[1:])
         else:
+            if resize_shape is not None and img.shape[-2:] != tuple(resize_shape):
+                img = F.interpolate(
+                    img, size=resize_shape, mode="bilinear", align_corners=False
+                )
             batch[key] = jitter(img)
     return batch
 
@@ -415,7 +436,9 @@ def main():
         for batch in train_dataloader:
             # Training-only image augmentation (BEFORE normalization in preprocessor)
             if color_jitter is not None:
-                batch = apply_color_jitter(batch, image_keys, color_jitter, device)
+                batch = apply_color_jitter(
+                    batch, image_keys, color_jitter, device, resize_shape=cfg.resize_shape
+                )
 
             # Forward pass (optionally in bf16 for ~1.5-2x speedup on Ampere+/Blackwell)
             batch = preprocessor(batch)
