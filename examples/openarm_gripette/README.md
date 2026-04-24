@@ -118,16 +118,22 @@ examples/openarm_gripette/
 
     # --- Dataset & training ---
     convert_dataset.py     # Transform dataset: axis-angle → 6D, compute deltas, choose proprioception
+    convert_rotation_6d.py # Utility: rotation representation conversion
     train.py               # Training script (validation split + wandb + HF Hub push)
     push_checkpoint.py     # Push an already-trained checkpoint to HuggingFace Hub
 
-    # --- Diagnostic ---
+    # --- Diagnostics (no policy / no GPU required) ---
     offline_replay.py      # Replay recorded episodes through the policy, compare predictions vs GT
+    read_arm_state.py      # Print the live arm state (joints + EE pose) from ArmService
+    view_camera.py         # Display the Gripette camera feed in an OpenCV window
+    cartesian_square.py    # Move the EE along a 20×20 cm square (pipeline smoke test)
+    cartesian_sinusoid.py  # Clean sinusoidal Cartesian motion — isolates pipeline vs policy jerk
+    set_arm_pose.py        # Smoothly move the arm to a specified single joint configuration
+    reset_arm.py           # Multi-waypoint safe reset (visits joint configs in sequence)
 
     # --- Closed-loop evaluation (simulator or real robot) ---
     eval_simulator.py      # Continuous inference via gRPC (works with sim OR real-robot server)
     evaluate.py            # Episode-based evaluation with reset + success tracking
-    set_arm_pose.py        # Smoothly move the arm to a specified joint configuration
 
     # --- Real robot deployment ---
     grpc_server_real.py    # gRPC server driving a real OpenArm via CAN — same API as simulator
@@ -138,29 +144,39 @@ examples/openarm_gripette/
 
 ### Software
 
+Two commands. `uv sync --locked --extra gripette` bundles everything LeRobot
+needs for this workflow (diffusion, training, dataset, grpcio==1.73.1,
+kinematics/placo, openarms/CAN, mujoco). The two editable installs add the
+out-of-tree simulator and model packages, which are not in the lockfile.
+
 ```bash
-# Base LeRobot + diffusion + training extras (includes wandb, matplotlib)
-uv sync --locked --extra diffusion --extra training --extra dataset
+# 1. LeRobot side (includes wandb, matplotlib, grpcio, placo, mujoco, etc.)
+uv sync --locked --extra gripette
 
-# For real robot deployment:
-#   kinematics -> placo (FK/IK)
-#   openarms   -> Damiao motor driver + python-can (CAN bus)
-uv sync --locked --extra kinematics --extra openarms
+# 2. Out-of-tree editable installs. --no-deps keeps the simulator's
+#    `opencv-python` (GUI variant) from clobbering LeRobot's
+#    `opencv-python-headless`. All its other deps are already in the
+#    `gripette` extra at pinned versions, so --no-deps leaves nothing missing.
+uv pip install -e /path/to/openarm_gripette_model --no-deps
+uv pip install -e /path/to/openarm_gripette_simu  --no-deps
+```
 
-# For simulator inference: install the simulator package as editable
-uv pip install -e /path/to/openarm_gripette_simu
+**Repeat steps 2 and 3 after every `uv sync --locked`** — uv enforces the
+lockfile exactly and wipes editable installs not declared in it. The commands
+are idempotent, so re-running them after a sync takes a second.
 
-# IMPORTANT: the simulator's gRPC stubs must be generated with a grpcio version
-# compatible with LeRobot's pinned version (1.73.1). If you see a version mismatch
-# error at runtime, regenerate the stubs:
-#   cd /path/to/openarm_gripette_simu
-#   uv run --with "grpcio-tools==1.73.1" python -m grpc_tools.protoc \
-#       -I proto --python_out=openarm_gripette_simu/proto \
-#       --grpc_python_out=openarm_gripette_simu/proto \
-#       proto/arm.proto proto/gripper.proto
-#   # Then fix relative imports in the generated _grpc.py files:
-#   sed -i 's/^import arm_pb2 as/from . import arm_pb2 as/' openarm_gripette_simu/proto/arm_pb2_grpc.py
-#   sed -i 's/^import gripper_pb2 as/from . import gripper_pb2 as/' openarm_gripette_simu/proto/gripper_pb2_grpc.py
+**If you see a grpcio version mismatch** when running any eval script, the
+simulator's gRPC stubs were generated against a different grpcio version.
+Regenerate them:
+
+```bash
+cd /path/to/openarm_gripette_simu
+uv run --with "grpcio-tools==1.73.1" python -m grpc_tools.protoc \
+    -I proto --python_out=openarm_gripette_simu/proto \
+    --grpc_python_out=openarm_gripette_simu/proto \
+    proto/arm.proto proto/gripper.proto
+sed -i 's/^import arm_pb2 as/from . import arm_pb2 as/' openarm_gripette_simu/proto/arm_pb2_grpc.py
+sed -i 's/^import gripper_pb2 as/from . import gripper_pb2 as/' openarm_gripette_simu/proto/gripper_pb2_grpc.py
 ```
 
 ### Hardware (for real robot only)
@@ -371,22 +387,32 @@ as the simulator. The eval client connects to both endpoints.
 ```
 
 ```bash
-# On the robot controller machine: start the arm-only gRPC server
+# On the robot controller machine: start the arm-only gRPC server.
+# The server has a built-in 50 Hz joint-space setpoint interpolator
+# (see "Tuning for Real Hardware" below).
 uv run python examples/openarm_gripette/grpc_server_real.py \
     --can_port can0 --side right --arm_port 50052
 
 # The Gripette's gRPC service is already running (on <gripette-ip>:<gripette-port>)
 # — it ships with the Gripette.
 
-# On the inference machine:
+# On the inference machine, home the arm first. Use reset_arm.py with a
+# multi-waypoint preset if a direct move would collide with the table.
+uv run python examples/openarm_gripette/reset_arm.py \
+    --arm_addr <robot-ip>:50052 --preset home_right_over_table
+
+# Or, for a single-hop reset to a known-safe pose:
 uv run python examples/openarm_gripette/set_arm_pose.py \
     --arm_addr <robot-ip>:50052 \
-    --joints_deg 0 0 0 90 0 0 0             # move to a safe starting pose
+    --joints_deg 0 0 0 90 0 0 0
 
+# Run the policy. For a first trial: slow it down and use the async gripper
+# sender (see "Tuning" for what these do).
 uv run python examples/openarm_gripette/eval_simulator.py \
     --checkpoint outputs/gripette/run_001/best \
     --arm_addr <robot-ip>:50052 \
     --gripper_addr <gripette-ip>:<gripette-port> \
+    --device cuda --gripper_async --action_scale 0.5 \
     --duration 30
 ```
 
@@ -466,6 +492,89 @@ environment variable).
 See `docs/umi_analysis.md` for a detailed comparison with the UMI reference
 implementation.
 
+## Tuning for Real Hardware
+
+Closed-loop policy execution on the real arm introduces several loop-timing and
+smoothness issues that don't exist in simulation. The scripts ship with a set of
+CLI knobs for addressing each one independently.
+
+### Server-side: joint-space setpoint interpolator (`grpc_server_real.py`)
+
+Policy commands arrive at ~10 Hz but MIT motor gains are stiff — without
+smoothing, the motors see a 10 Hz staircase and the arm feels jerky. The server
+runs a background thread that drives the motors at `--interp_hz` (default 50 Hz)
+with an exponential approach toward the latest IK solution:
+
+```
+# Defaults are usually fine; lower alpha for more smoothing + more lag.
+uv run python examples/openarm_gripette/grpc_server_real.py \
+    --can_port can0 --side right \
+    --interp_hz 50 --interp_alpha 0.3
+```
+
+| Flag             | Default | Effect                                                                                                                         |
+| ---------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `--interp_hz`    | 50      | Interpolator tick rate. Higher = smoother motor input.                                                                         |
+| `--interp_alpha` | 0.3     | Per-tick exponential approach rate. Lag ≈ 1 / (`alpha` · `interp_hz`) ≈ 67 ms at defaults. 0.1 = heavy smoothing, 0.5 = light. |
+| `--kp_scale`     | 1.0     | Multiplier on MIT position_kp. `0.5` halves all kp (softer tracking). Usually unnecessary once the interpolator is in use.     |
+| `--kd_scale`     | 1.0     | Multiplier on MIT position_kd. Scale ~`sqrt(kp_scale)` to preserve damping.                                                    |
+
+Use `cartesian_sinusoid.py` to tune the interpolator independently of the policy:
+it sends a mathematically smooth sinusoid through the pipeline, so any remaining
+jerk is pure server/motor/IK. See its `--help` for options.
+
+### Client-side: speed control (`eval_simulator.py` / `evaluate.py`)
+
+```
+# Safe-first defaults for the real robot.
+... --gripper_async --action_scale 0.5
+```
+
+| Flag             | Default | Effect                                                                                                                             |
+| ---------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `--action_scale` | 1.0     | Multiplies Cartesian deltas (position + 6D rotation). `0.5` halves commanded speed; gripper unchanged. Trajectory shape preserved. |
+| `--fps`          | 10      | Control loop rate. Lower = slower motion + slower observation rate. Prefer `--action_scale` for speed control.                     |
+
+### Client-side: decoupling the Gripette RPC (`eval_simulator.py`)
+
+The Gripette's `SendMotorCommand` RPC can take 100 ms – several seconds on the
+Pi Zero 2W under load (camera streaming contends for CPU). Sending it
+synchronously in the control loop stalls the arm:
+
+```
+... --gripper_async
+```
+
+A background thread takes the latest goal and fires the RPC whenever the server
+can accept one; intermediate goals are dropped (last-wins). The control loop
+runs at 10 Hz regardless of Gripette latency.
+
+### Client-side: policy output smoothing (`eval_simulator.py`)
+
+The server-side interpolator smooths the _pipeline_ jerk. These client-side
+knobs smooth the _policy's own output noise_ before it reaches the server —
+often not needed once the interpolator is tuned, but available:
+
+| Flag                    | Default   | Effect                                                                                                                         |
+| ----------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `--temporal_ensemble`   | off       | ACT-style: predict every step, weighted-average across overlapping chunks for each timestep. Bypasses `select_action`'s queue. |
+| `--temporal_ensemble_k` | 0.1       | Weight decay for temporal ensembling (`w_i = exp(-k · age)`). `0.02` = near-uniform averaging (very smooth); `0.5` = light.    |
+| `--delta_ema_alpha`     | off       | EMA low-pass on Cartesian deltas. `0.3` = moderate, `0.15` = heavy. Does _not_ touch the gripper (absolute, not a delta).      |
+| `--n_action_steps`      | from ckpt | Override the checkpoint's value at inference time. `1` = re-infer every step (eliminates chunk-boundary jumps).                |
+
+### Diagnostic workflow
+
+When motion looks wrong, in this order:
+
+1. **`cartesian_sinusoid.py`** — clean input, isolates the pipeline. If jerky
+   here, it's server/motors. If smooth here, the pipeline is fine.
+2. **`read_arm_state.py`** and **`view_camera.py`** — sanity-check the
+   observation side before accusing the policy.
+3. **`offline_replay.py`** — compare policy predictions vs dataset ground
+   truth. Rules out a model-quality issue before tuning loops.
+4. Only then: tune the policy run (`--action_scale`, `--temporal_ensemble`,
+   `--delta_ema_alpha`).
+
 ## Troubleshooting
 
 ### "grpcio version mismatch" when running eval_simulator.py or evaluate.py
@@ -496,6 +605,52 @@ Most likely causes:
 Likely a **FPS scaling issue**: if data was recorded at 50 FPS but eval runs at 10 Hz,
 each delta covers 100ms instead of 20ms — effectively 5x slower. Check that
 `eval_simulator.py --fps` matches the dataset's recording FPS.
+
+### Policy moves too fast on the real arm (scary)
+
+Use `--action_scale 0.5` on the client to halve commanded Cartesian velocity while
+keeping the observation rate at the trained FPS. Start at `0.3-0.5` for initial
+safety trials. See "Tuning for Real Hardware" → Client-side: speed control.
+
+### Real-robot control loop runs at 1-4 Hz (should be 10 Hz) with SLOW tags everywhere
+
+Enable `--debug`'s per-step breakdown in `eval_simulator.py` and check which phase
+is the bottleneck (`cam`, `getstate`, `infer`, `cart`, `grip`). The usual culprit
+is `grip` — the Gripette's `SendMotorCommand` can block the loop for hundreds of
+ms. Fix: `--gripper_async`. See "Tuning for Real Hardware" → Client-side: decoupling
+the Gripette RPC.
+
+### Arm motion feels jerky / buzzy at the policy rate
+
+First run `cartesian_sinusoid.py` through the same server to confirm the jerk
+is or isn't in the pipeline:
+
+```bash
+uv run python examples/openarm_gripette/cartesian_sinusoid.py \
+    --arm_addr <robot-ip>:50052
+```
+
+If the sinusoid is jerky, it's a server-side issue. The fix is the built-in
+joint-space setpoint interpolator — already on by default. Tune with
+`--interp_alpha` on `grpc_server_real.py` (lower = smoother). See "Tuning for
+Real Hardware".
+
+If the sinusoid is smooth but the policy is jerky, it's policy-output noise.
+Try `--delta_ema_alpha 0.3` or `--temporal_ensemble --temporal_ensemble_k 0.05`
+on the client.
+
+### Reset to home collides with workspace (e.g., table)
+
+The server's single-hop `Reset` does a straight-line joint interpolation from
+the current pose to the target, which can cross obstacles. Use
+`reset_arm.py` instead to visit a sequence of safe intermediate waypoints:
+
+```bash
+uv run python examples/openarm_gripette/reset_arm.py \
+    --arm_addr <robot-ip>:50052 --preset home_right_over_table
+```
+
+Edit the `PRESETS` dict in the script to match your actual table geometry.
 
 ### Mode averaging (policy moves toward a "preferred" position regardless of target)
 

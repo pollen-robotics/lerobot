@@ -195,6 +195,29 @@ hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.13,<0.2.0", "lerobot[grpci
 async = ["lerobot[grpcio-dep]", "lerobot[matplotlib-dep]"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
 
+# Gripette: all-in-one extra for the SLAM-recorded diffusion policy workflow
+# (examples/openarm_gripette/). One `uv sync --locked --extra gripette` prepares
+# the entire environment end-to-end. Pair with:
+#   uv pip install -e /path/to/openarm_gripette_simu --no-deps
+# to add the simulator itself; --no-deps is kept so its `opencv-python` (GUI)
+# does not clobber LeRobot's `opencv-python-headless` — all other simulator
+# dependencies (grpcio, protobuf, mujoco, placo) are bundled here at versions
+# matching LeRobot's lockfile, so --no-deps no longer leaves anything missing.
+gripette = [
+    "lerobot[diffusion]",
+    "lerobot[training]",
+    "lerobot[dataset]",
+    "lerobot[grpcio-dep]",
+    "lerobot[kinematics]",
+    "lerobot[openarms]",
+    "lerobot[matplotlib-dep]",
+    "mujoco>=3.6,<4.0",
+    # Qt backend for matplotlib. Ships its own bundled Qt libs so GUI display
+    # in view_camera.py works on uv-managed Python without relying on the
+    # system / uv Tk bundle (which is often mismatched on managed Python).
+    "PyQt5>=5.15,<6.0",
+]
+
 # Development
 dev = ["pre-commit>=3.7.0,<5.0.0", "debugpy>=1.8.1,<1.9.0", "lerobot[grpcio-dep]", "grpcio-tools==1.73.1", "mypy>=1.19.1", "ruff>=0.14.1"]
 test = ["pytest>=8.1.0,<9.0.0", "pytest-timeout>=2.4.0,<3.0.0", "pytest-cov>=5.0.0,<8.0.0", "mock-serial>=0.0.1,<0.1.0 ; sys_platform != 'win32'"]

@@ -348,6 +348,15 @@ def parse_args():
         "0.2-0.5 (smaller = more smoothing but more lag). Not applied to the "
         "gripper channel (which is absolute, not a delta). Default: off.",
     )
+    p.add_argument(
+        "--action_scale",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to Cartesian delta commands (position + 6D rotation). "
+        "0.5 halves the commanded speed while keeping observation rate at --fps, "
+        "so the policy sees the world at the trained rate but the arm moves slower. "
+        "Useful for safe testing. Not applied to the gripper (absolute command).",
+    )
     return p.parse_args()
 
 
@@ -460,6 +469,9 @@ def main():
     if args.delta_ema_alpha is not None:
         logger.info(f"Post-policy EMA ON for Cartesian deltas (alpha={args.delta_ema_alpha})")
 
+    if args.action_scale != 1.0:
+        logger.info(f"Action scale = {args.action_scale} (Cartesian deltas only; gripper unchanged)")
+
     logger.info(f"Running for {args.duration}s at {args.fps} Hz")
 
     try:
@@ -536,6 +548,12 @@ def main():
             delta_rot_6d = action_np[3:9].copy()
             gripper_goal = action_np[9:]
             raw_pos_mm = float(np.linalg.norm(delta_pos) * 1000)
+
+            # Optional speed scaling on Cartesian deltas (position + 6D rotation).
+            # The gripper is absolute, so we leave it alone.
+            if args.action_scale != 1.0:
+                delta_pos = delta_pos * args.action_scale
+                delta_rot_6d = delta_rot_6d * args.action_scale
 
             # Optional EMA on the Cartesian delta channels (position + 6D rotation).
             # Gripper stays untouched — it's an absolute command, not a delta.
