@@ -34,8 +34,13 @@ from lerobot.policies.diffusion import DiffusionConfig, DiffusionPolicy
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 
-def apply_color_jitter(batch: dict, image_keys: list[str], jitter: T.ColorJitter) -> dict:
+def apply_color_jitter(
+    batch: dict, image_keys: list[str], jitter: T.ColorJitter, device: torch.device
+) -> dict:
     """Apply color jitter to image tensors in the batch (training-only augmentation).
+
+    Images are moved to ``device`` first so the jitter runs on GPU — otherwise
+    the CPU jitter path dominates iteration time on a GPU-bound training loop.
 
     Random per-batch brightness / contrast / saturation / hue perturbations.
     Applied in-place on the image tensors so the batch dict is returned unchanged
@@ -50,7 +55,9 @@ def apply_color_jitter(batch: dict, image_keys: list[str], jitter: T.ColorJitter
     for key in image_keys:
         if key not in batch:
             continue
-        img = batch[key]
+        # Move to GPU first: ColorJitter on a CUDA tensor runs on the GPU and
+        # takes ~microseconds; on CPU it's ~tens of ms per batch (dominating).
+        img = batch[key].to(device, non_blocking=True)
         # Image shape from the dataloader: (B, T, C, H, W) because of n_obs_steps>1.
         # ColorJitter expects (..., C, H, W) — it handles batched inputs directly.
         # Flatten batch+time dims so jitter is random per-frame (not per-batch):
@@ -71,14 +78,18 @@ def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[flo
 
 
 @torch.no_grad()
-def compute_val_loss(policy, preprocessor, val_dataloader, device, max_batches=50):
+def compute_val_loss(policy, preprocessor, val_dataloader, device, max_batches=50, bf16=False):
     """Compute average loss on the validation set."""
     policy.eval()
     total_loss = 0.0
     num_batches = 0
     for batch in val_dataloader:
         batch = preprocessor(batch)
-        loss, _ = policy.forward(batch)
+        if bf16 and device.type == "cuda":
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                loss, _ = policy.forward(batch)
+        else:
+            loss, _ = policy.forward(batch)
         total_loss += loss.item()
         num_batches += 1
         if num_batches >= max_batches:
@@ -143,6 +154,32 @@ def parse_args():
         action="store_true",
         help="Enable color jitter augmentation during training (UMI values)",
     )
+    # -- GPU throughput --
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="DataLoader workers. Higher helps keep the GPU fed; typical range 4-16.",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=4,
+        help="Batches pre-loaded per worker. Default=4 hides most data-loading stalls.",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Use bfloat16 autocast for forward/backward. ~1.5-2x speedup on Ampere+/Blackwell "
+        "(RTX 30xx/40xx/50xx). No GradScaler needed; bf16 has fp32-range exponent.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the policy. Adds 1-5 min warm-up at start but typically yields "
+        "20-40%% throughput on recent GPUs. Experimental for diffusion — disable if training "
+        "errors out during warmup.",
+    )
     return parser.parse_args()
 
 
@@ -151,6 +188,14 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+
+    # ---- GPU throughput knobs ----
+    # cudnn.benchmark picks the fastest conv kernel per-shape (stable shape = big win).
+    # TF32 on Ampere+/Blackwell: ~2x faster matmul than fp32 with negligible accuracy hit.
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     # ---- Dataset metadata ----
     # Load metadata without downloading the full dataset. This gives us the feature
@@ -243,6 +288,14 @@ def main():
     param_count = sum(p.numel() for p in policy.parameters())
     print(f"\nModel parameters: {param_count:,}")
 
+    # ---- Optional torch.compile ----
+    # Compile triggers lazy tracing; first forward takes 1-5 min. Subsequent iters
+    # run ~20-40% faster on recent GPUs. Disable via --compile if it errors out.
+    compiled_policy = None
+    if args.compile:
+        print("  torch.compile: compiling policy (first iteration will be slow)...")
+        compiled_policy = torch.compile(policy, mode="reduce-overhead", dynamic=False)
+
     # ---- Pre/post processors ----
     # The preprocessor converts raw data to model input:
     #   rename -> add batch dim -> move to device -> relative actions -> normalize
@@ -287,7 +340,9 @@ def main():
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
-        num_workers=4,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
@@ -360,13 +415,18 @@ def main():
         for batch in train_dataloader:
             # Training-only image augmentation (BEFORE normalization in preprocessor)
             if color_jitter is not None:
-                batch = apply_color_jitter(batch, image_keys, color_jitter)
+                batch = apply_color_jitter(batch, image_keys, color_jitter, device)
 
-            # Forward pass
+            # Forward pass (optionally in bf16 for ~1.5-2x speedup on Ampere+/Blackwell)
             batch = preprocessor(batch)
-            loss, _ = policy.forward(batch)
+            fwd_policy = compiled_policy if compiled_policy is not None else policy
+            if args.bf16 and device.type == "cuda":
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    loss, _ = fwd_policy.forward(batch)
+            else:
+                loss, _ = fwd_policy.forward(batch)
 
-            # Backward pass
+            # Backward pass (bf16 doesn't need GradScaler; fp32-range exponent handles it)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -376,7 +436,9 @@ def main():
             # ---- Validation ----
             val_loss = None
             if step > 0 and step % args.eval_freq == 0:
-                val_loss = compute_val_loss(policy, preprocessor, val_dataloader, device)
+                val_loss = compute_val_loss(
+                    policy, preprocessor, val_dataloader, device, bf16=args.bf16
+                )
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
