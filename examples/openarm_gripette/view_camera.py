@@ -12,18 +12,27 @@ Press 'q' in the figure window or Ctrl+C in the terminal to quit.
 """
 
 import argparse
+import os
 import time
 
-import cv2
-import grpc
-import matplotlib
+import cv2  # must be imported before matplotlib so we can clear its Qt plugin hijack
+
+# cv2 (opencv-python-headless wheel) ships its own incomplete Qt plugin dir and
+# sets QT_QPA_PLATFORM_PLUGIN_PATH on import. That directory is missing the
+# 'xcb' platform plugin on Linux, which makes PyQt5 fail with
+# "Could not load the Qt platform plugin xcb". Clearing the env var lets PyQt5
+# fall back to its own bundled Qt plugins, which include xcb.
+os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+
+import grpc  # noqa: E402
+import matplotlib  # noqa: E402
 
 # Force an interactive backend. uv-managed Python defaults to the non-GUI
 # 'Agg' backend when matplotlib is imported as a library. QtAgg (requires
 # PyQt5) is more portable than TkAgg on uv's managed Python, which ships
 # a version of Tk that often mismatches matplotlib's _tkagg expectations.
 matplotlib.use("QtAgg")
-import matplotlib.pyplot as plt  # noqa: E402 (must import after matplotlib.use)
+import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from openarm_gripette_simu.proto import gripper_pb2, gripper_pb2_grpc  # noqa: E402
 

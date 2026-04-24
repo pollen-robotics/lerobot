@@ -357,6 +357,22 @@ def parse_args():
         "so the policy sees the world at the trained rate but the arm moves slower. "
         "Useful for safe testing. Not applied to the gripper (absolute command).",
     )
+    p.add_argument(
+        "--ood_delta_mm",
+        type=float,
+        default=None,
+        help="Safety watchdog: maximum |delta_pos| in mm per step. Predictions above this "
+        "threshold are treated as out-of-distribution — a zero delta is commanded that step, "
+        "and after --ood_halt_count consecutive violations the loop halts. Disabled by default. "
+        "Typical value: 3-5 * mean training delta magnitude (e.g. 8.0 for this dataset).",
+    )
+    p.add_argument(
+        "--ood_halt_count",
+        type=int,
+        default=3,
+        help="Number of consecutive OOD steps before halting the loop. Only applies "
+        "when --ood_delta_mm is set.",
+    )
     return p.parse_args()
 
 
@@ -472,6 +488,14 @@ def main():
     if args.action_scale != 1.0:
         logger.info(f"Action scale = {args.action_scale} (Cartesian deltas only; gripper unchanged)")
 
+    # ---- OOD watchdog state ----
+    ood_consecutive = 0
+    if args.ood_delta_mm is not None:
+        logger.info(
+            f"OOD watchdog ON: |delta_pos| > {args.ood_delta_mm}mm treated as OOD; "
+            f"zero delta sent that step; halt after {args.ood_halt_count} consecutive OOD steps"
+        )
+
     logger.info(f"Running for {args.duration}s at {args.fps} Hz")
 
     try:
@@ -565,6 +589,30 @@ def main():
                     prev_delta = args.delta_ema_alpha * cart_delta + (1.0 - args.delta_ema_alpha) * prev_delta
                 delta_pos = prev_delta[:3].copy()
                 delta_rot_6d = prev_delta[3:9].copy()
+
+            # --- OOD watchdog: zero the delta if it's above threshold ---
+            # Gripper is absolute — we don't touch it. Rotation delta follows the
+            # position decision for consistency (if position is OOD, the whole
+            # Cartesian command is suspect).
+            commanded_mm = float(np.linalg.norm(delta_pos) * 1000)
+            ood_this_step = (
+                args.ood_delta_mm is not None and commanded_mm > args.ood_delta_mm
+            )
+            if ood_this_step:
+                ood_consecutive += 1
+                logger.warning(
+                    f"OOD delta {commanded_mm:.1f}mm > {args.ood_delta_mm}mm "
+                    f"(consecutive={ood_consecutive}/{args.ood_halt_count}) — zeroing arm delta"
+                )
+                delta_pos = np.zeros(3)
+                delta_rot_6d = np.zeros(6)
+                if ood_consecutive >= args.ood_halt_count:
+                    logger.error(
+                        f"{args.ood_halt_count} consecutive OOD steps — halting loop for safety"
+                    )
+                    break
+            else:
+                ood_consecutive = 0
 
             # --- 5. Debug ---
             if args.debug:
