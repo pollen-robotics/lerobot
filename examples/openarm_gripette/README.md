@@ -1,5 +1,10 @@
 # OpenArm Gripette: Diffusion Policy with SLAM-Recorded Demonstrations
 
+> **Want to just train and deploy a model?** See [**GUIDE.md**](GUIDE.md) — a
+> linear, copy-paste walkthrough from setup to real-robot evaluation.
+> This README is the reference for the _how_ and _why_ (design decisions,
+> architecture, tuning levers); GUIDE.md is the _what to run_.
+
 Train a **Diffusion Policy** on demonstrations recorded with a hand-held SLAM device,
 and deploy it on a **Pollen OpenArm** robot (or its MuJoCo simulator).
 
