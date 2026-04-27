@@ -34,6 +34,30 @@ from lerobot.policies.diffusion import DiffusionConfig, DiffusionPolicy
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 
+def apply_state_noise(batch: dict, std: float, device: torch.device) -> dict:
+    """Add zero-mean Gaussian noise to observation.state (training-only).
+
+    The proprioception channel here is the 2D gripper joint state. With a
+    small visible scripted-demo distribution the policy can memorise the
+    state→action mapping and ignore the camera; jitter on the state input
+    forces it to rely on visual features. Standard regulariser used in
+    UMI / diffusion-policy work.
+
+    Called BEFORE the preprocessor so normalization stats apply to the
+    noised value. Gradients flow through the noise (it is just an additive
+    perturbation, not a stochastic node we backprop through).
+    """
+    if std <= 0.0:
+        return batch
+    state = batch.get("observation.state")
+    if state is None:
+        return batch
+    state = state.to(device, non_blocking=True)
+    noise = torch.randn_like(state) * std
+    batch["observation.state"] = state + noise
+    return batch
+
+
 def apply_color_jitter(
     batch: dict,
     image_keys: list[str],
@@ -174,6 +198,15 @@ def parse_args():
         "--color_jitter",
         action="store_true",
         help="Enable color jitter augmentation during training (UMI values)",
+    )
+    parser.add_argument(
+        "--state_noise_std",
+        type=float,
+        default=0.0,
+        help="Per-step Gaussian noise std added to observation.state during "
+             "training (radians, since observation.state is gripper joints). "
+             "Discourages the policy from memorising state→action and forces "
+             "the visual encoder to carry information. 0.0 disables.",
     )
     # -- GPU throughput --
     parser.add_argument(
@@ -411,6 +444,7 @@ def main():
                 "use_relative_actions": cfg.use_relative_actions,
                 "relative_exclude_joints": cfg.relative_exclude_joints,
                 "color_jitter": args.color_jitter,
+                "state_noise_std": args.state_noise_std,
                 "crop_ratio": cfg.crop_ratio,
                 "action_dim": cfg.action_feature.shape[0],
                 "state_dim": cfg.robot_state_feature.shape[0],
@@ -439,6 +473,9 @@ def main():
                 batch = apply_color_jitter(
                     batch, image_keys, color_jitter, device, resize_shape=cfg.resize_shape
                 )
+            # Training-only state-noise regulariser (BEFORE normalization)
+            if args.state_noise_std > 0.0:
+                batch = apply_state_noise(batch, args.state_noise_std, device)
 
             # Forward pass (optionally in bf16 for ~1.5-2x speedup on Ampere+/Blackwell)
             batch = preprocessor(batch)
