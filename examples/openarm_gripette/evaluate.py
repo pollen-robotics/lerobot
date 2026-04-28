@@ -265,10 +265,16 @@ def main():
             logger.error(f"Reset failed: {reset_resp.error}")
             continue
 
+        # Explicitly re-open the gripper between episodes. arm_stub.Reset()
+        # only re-randomizes the arm/cube; without this, the gripper retains
+        # the closed state from the previous episode's grasp + lift, which
+        # is severely out of distribution for the policy at episode start.
+        gripper_stub.SendMotorCommand(gripper_pb2.MotorCommand(motor1_goal=0.0, motor2_goal=0.0))
+
         # Reset policy action queue
         policy.reset()
 
-        # Small delay for physics to settle
+        # Small delay for physics to settle (and for gripper to actually open)
         time.sleep(0.5)
 
         # Capture start pose for relative proprioception (after reset)

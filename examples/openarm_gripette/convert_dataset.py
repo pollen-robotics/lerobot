@@ -185,6 +185,19 @@ def parse_args():
         default="none",
         help="State mode: 'none' = gripper only (2D), 'relative' = pose relative to episode start (11D)",
     )
+    parser.add_argument(
+        "--push_to_hub",
+        type=str,
+        default=None,
+        help="If set, push the converted dataset to this Hub repo id "
+             "(e.g. 'SteveNguyen/sim_grasp_train_v2'). If the local repo "
+             "id does not match, the push retargets to this id.",
+    )
+    parser.add_argument(
+        "--hub_private",
+        action="store_true",
+        help="Make the Hub repo private (default: public).",
+    )
     return parser.parse_args()
 
 
@@ -325,6 +338,17 @@ def main():
     logger.info(f"\n  Position delta magnitude: {np.linalg.norm(pos_delta) * 1000:.2f} mm")
 
     logger.info("\nConversion complete!")
+
+    if args.push_to_hub:
+        target = args.push_to_hub
+        logger.info(f"\nPushing to Hub repo: {target} (private={args.hub_private})")
+        ds_push = LeRobotDataset(args.repo_id)
+        if target != args.repo_id:
+            # Retarget — same approach as the standalone push helper.
+            ds_push.repo_id = target
+            ds_push.meta.repo_id = target
+        ds_push.push_to_hub(private=args.hub_private, push_videos=True)
+        logger.info(f"Pushed: {target}")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,46 @@ from lerobot.policies.diffusion import DiffusionConfig, DiffusionPolicy
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 
+def save_train_state(ckpt_dir: Path, *, optimizer, step: int, best_val_loss: float):
+    """Save optimizer + bookkeeping next to the model checkpoint, so the run
+    can be resumed exactly later."""
+    torch.save(
+        {
+            "step": int(step),
+            "best_val_loss": float(best_val_loss),
+            "optimizer": optimizer.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": (
+                torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            ),
+        },
+        ckpt_dir / "train_state.pt",
+    )
+
+
+def load_train_state(ckpt_dir: Path, optimizer, device: torch.device):
+    """Load optimizer + bookkeeping. Returns (step, best_val_loss). If
+    train_state.pt is missing (older checkpoint), returns (0, inf) and the
+    user gets a fresh-start training but with the loaded model weights."""
+    p = ckpt_dir / "train_state.pt"
+    if not p.exists():
+        print(f"  WARNING: {p} not found; resuming model only (step=0, best_val=inf).")
+        return 0, float("inf")
+    state = torch.load(p, map_location=device)
+    optimizer.load_state_dict(state["optimizer"])
+    if "torch_rng_state" in state:
+        torch.set_rng_state(state["torch_rng_state"].cpu())
+    if torch.cuda.is_available() and state.get("cuda_rng_state") is not None:
+        try:
+            torch.cuda.set_rng_state(state["cuda_rng_state"].cpu())
+        except Exception:
+            pass
+    step = int(state["step"])
+    best = float(state["best_val_loss"])
+    print(f"  Resumed: step={step}, best_val_loss={best:.4f}")
+    return step, best
+
+
 def apply_state_noise(batch: dict, std: float, device: torch.device) -> dict:
     """Add zero-mean Gaussian noise to observation.state (training-only).
 
@@ -208,6 +248,25 @@ def parse_args():
              "Discourages the policy from memorising state→action and forces "
              "the visual encoder to carry information. 0.0 disables.",
     )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to a checkpoint directory (e.g. outputs/.../checkpoint_010000 "
+             "or .../best) to resume training from. Loads model weights, "
+             "optimizer state, step counter, best val_loss tracker and rng. "
+             "Continues until --training_steps. The model config still comes "
+             "from --dataset_repo_id and the policy code, so make sure they "
+             "match the saved checkpoint.",
+    )
+    parser.add_argument(
+        "--wandb_resume_id",
+        type=str,
+        default=None,
+        help="Optional wandb run id to resume into. Without this, --resume_from "
+             "starts a fresh wandb run (the original run becomes orphaned). "
+             "Find the id in the original run URL: wandb.ai/<entity>/<proj>/runs/<ID>.",
+    )
     # -- GPU throughput --
     parser.add_argument(
         "--num_workers",
@@ -335,7 +394,12 @@ def main():
     )
 
     # ---- Instantiate policy ----
-    policy = DiffusionPolicy(cfg)
+    if args.resume_from:
+        ckpt_path = Path(args.resume_from)
+        print(f"\nResuming from checkpoint: {ckpt_path}")
+        policy = DiffusionPolicy.from_pretrained(ckpt_path)
+    else:
+        policy = DiffusionPolicy(cfg)
     policy.train()
     policy.to(device)
 
@@ -410,6 +474,14 @@ def main():
     # ---- Optimizer ----
     optimizer = cfg.get_optimizer_preset().build(policy.parameters())
 
+    # ---- Resume bookkeeping ----
+    resumed_step = 0
+    resumed_best_val = float("inf")
+    if args.resume_from:
+        resumed_step, resumed_best_val = load_train_state(
+            Path(args.resume_from), optimizer, device,
+        )
+
     # ---- Color jitter augmentation (training only, not saved to checkpoint) ----
     # UMI defaults: brightness=0.3, contrast=0.4, saturation=0.5, hue=0.08.
     color_jitter = None
@@ -426,6 +498,8 @@ def main():
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
+            id=args.wandb_resume_id,
+            resume="allow" if args.wandb_resume_id else None,
             config={
                 "dataset": args.dataset_repo_id,
                 "batch_size": args.batch_size,
@@ -463,8 +537,8 @@ def main():
         print(f"  Wandb:            {args.wandb_project}")
     print()
 
-    best_val_loss = float("inf")
-    step = 0
+    best_val_loss = resumed_best_val
+    step = resumed_step
     done = False
     while not done:
         for batch in train_dataloader:
@@ -507,6 +581,8 @@ def main():
                     policy.save_pretrained(best_dir)
                     preprocessor.save_pretrained(best_dir)
                     postprocessor.save_pretrained(best_dir)
+                    save_train_state(best_dir, optimizer=optimizer,
+                                     step=step, best_val_loss=best_val_loss)
 
                 print(
                     f"step: {step:>7d} / {args.training_steps}  "
@@ -530,6 +606,8 @@ def main():
                 policy.save_pretrained(ckpt_dir)
                 preprocessor.save_pretrained(ckpt_dir)
                 postprocessor.save_pretrained(ckpt_dir)
+                save_train_state(ckpt_dir, optimizer=optimizer,
+                                 step=step, best_val_loss=best_val_loss)
                 print(f"  -> saved checkpoint to {ckpt_dir}")
 
             step += 1
@@ -543,6 +621,8 @@ def main():
     policy.save_pretrained(output_dir)
     preprocessor.save_pretrained(output_dir)
     postprocessor.save_pretrained(output_dir)
+    save_train_state(output_dir, optimizer=optimizer,
+                     step=step, best_val_loss=best_val_loss)
     print(f"\nTraining complete. Model saved to {output_dir}")
 
     # ---- Push to HuggingFace Hub ----
