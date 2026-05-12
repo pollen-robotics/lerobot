@@ -234,20 +234,34 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
                 )
 
             with self._cmd_lock:
-                self._target_pos = self._target_pos + delta_pos
-                self._target_r6d = self._target_r6d + delta_r6d
-
-                target_rot = rotation_6d_to_matrix(self._target_r6d)
-                target_tf = np.eye(4)
-                target_tf[:3, :3] = target_rot
-                target_tf[:3, 3] = self._target_pos
-
+                # Camera-LOCAL frame deltas (Stage-6 convention). Matches
+                # the sim arm_servicer; see that file's SendCartesianDelta
+                # for the math. Required for real hardware because the
+                # iPhone SLAM world frame has an arbitrary yaw per session
+                # — world-frame additive deltas would point in different
+                # physical directions across sessions and break transfer.
                 arm_joints = self._arm.get_positions()
+                current_tf = self._kin.forward(arm_joints)
+                R_current = current_tf[:3, :3]
+                pos_current = current_tf[:3, 3]
+
+                delta_pos_world = R_current @ delta_pos
+                target_pos = pos_current + delta_pos_world
+
+                R_delta = rotation_6d_to_matrix(delta_r6d)
+                R_target = R_current @ R_delta
+
+                target_tf = np.eye(4)
+                target_tf[:3, :3] = R_target
+                target_tf[:3, 3] = target_pos
+
                 target_joints = self._kin.inverse(target_tf, current_joint_positions=arm_joints)
 
                 # Hand off to the interpolator — no direct motor write.
                 self._latest_target_joints = target_joints.copy()
 
+                # Monitoring snapshot (not used to integrate deltas — each
+                # delta is now relative to the CURRENT FK pose).
                 achieved_tf = self._kin.forward(target_joints)
                 self._target_pos = achieved_tf[:3, 3].copy()
                 self._target_r6d = rotation_matrix_to_6d(achieved_tf[:3, :3]).copy()

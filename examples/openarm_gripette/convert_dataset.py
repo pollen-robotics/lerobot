@@ -94,31 +94,59 @@ def pose_8d_to_11d(data_8d: np.ndarray) -> np.ndarray:
 
 
 def compute_delta_actions(poses_11d: np.ndarray, episode_indices: np.ndarray) -> np.ndarray:
-    """Compute per-frame delta actions from absolute poses.
+    """Compute per-frame delta actions in the CAMERA-LOCAL frame.
 
-    For position + rotation dims: delta[t] = pose[t+1] - pose[t]
-    For gripper dims: kept absolute (not delta).
-    At the last frame of each episode: delta = 0 (no next frame).
+    The recorded poses are camera-site SE(3) in a (per-session arbitrary)
+    world frame: gravity-aligned Z, but the X/Y horizontal axes depend on
+    the SLAM yaw at session start. World-frame deltas are therefore NOT
+    portable across sessions — a delta of (+5 mm, 0, 0) recorded in one
+    session points in a different physical direction in another.
 
-    Args:
-        poses_11d: (N, 11) absolute poses [x, y, z, r6d_0..5, proximal, distal]
-        episode_indices: (N,) episode index per frame
+    To make actions session-invariant, we express each delta in the
+    camera's local frame at time t:
 
-    Returns:
-        (N, 11) delta actions [dx, dy, dz, dr6d_0..5, proximal, distal]
+        delta_pos_local[t]  = R(cam_t)^T @ (pos[t+1] - pos[t])
+        R_delta_local[t]    = R(cam_t)^T @ R(cam_{t+1})           # proper composition
+        delta_r6d_local[t]  = rotation_matrix_to_6d(R_delta_local)
+
+    At deployment, the arm-side controller reads its current camera pose
+    via FK and applies:
+
+        target_pos = current_pos + R(current_cam) @ delta_pos_local
+        target_rot = R(current_cam) @ R_delta_local
+
+    which is fully invariant to any rotation of the world frame around Z
+    (the arbitrary part of the SLAM origin).
+
+    Gripper dims (9, 10) stay absolute — no frame to worry about.
+
+    At episode boundaries the delta is zeroed (no next frame).
     """
     n = len(poses_11d)
     actions = np.zeros((n, 11), dtype=np.float32)
 
-    # Position + rotation deltas (dims 0-8)
-    actions[:-1, :9] = poses_11d[1:, :9] - poses_11d[:-1, :9]
+    # Precompute rotation matrices for every frame.
+    R_all = rotation_6d_to_rotation_matrix_numpy(poses_11d[:, 3:9])  # (N, 3, 3)
+    pos_all = poses_11d[:, :3]                                       # (N, 3)
 
-    # Zero out deltas at episode boundaries
+    # Per-frame local-frame deltas. Vectorised wouldn't help much here
+    # since each row depends on the previous row's R.
+    for i in range(n - 1):
+        R_t = R_all[i]
+        R_t1 = R_all[i + 1]
+        delta_pos_world = pos_all[i + 1] - pos_all[i]
+        actions[i, :3] = R_t.T @ delta_pos_world
+        R_delta = R_t.T @ R_t1
+        actions[i, 3:9] = rotation_matrix_to_rotation_6d_numpy(
+            R_delta.reshape(1, 3, 3)
+        )[0]
+
+    # Zero out deltas at episode boundaries (action[last_frame_of_ep] = 0).
     ep_change = np.where(episode_indices[1:] != episode_indices[:-1])[0]
     actions[ep_change, :9] = 0.0
     actions[-1, :9] = 0.0
 
-    # Gripper: absolute values (dims 9-10)
+    # Gripper: absolute values (dims 9-10).
     actions[:, 9:] = poses_11d[:, 9:]
 
     return actions
