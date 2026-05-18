@@ -59,9 +59,15 @@ IDENTITY_R6D = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 MAX_PER_STEP_MM = 2.0
 
 # Square geometry — small and slow for a safe first test.
-SQUARE_HALF_SIZE = 0.05      # 5 cm half-edge → 10 cm square
-STEPS_PER_EDGE = 200         # 0.5 mm per step at default
+SQUARE_HALF_SIZE = 0.03      # 3 cm half-edge → 6 cm square (safer default)
+STEPS_PER_EDGE = 200         # 0.3 mm per step at default
 COMMAND_HZ = 20              # 200 steps × 1/20 s = 10 s per edge
+
+# `--tiny` preset: a 2 cm square. Used to rule out workspace-limit / wrist-
+# singularity issues when the regular size hits one of them. If the tiny
+# square is clean but the 6 cm one isn't, the failure is geometric (the larger
+# trajectory leaves the IK-friendly region near the seed pose).
+TINY_HALF_SIZE = 0.01        # 1 cm half-edge → 2 cm square
 
 
 def get_ee_pose(arm_stub) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -137,12 +143,20 @@ def parse_args():
     p.add_argument("--gripper_addr", type=str, default="localhost:50051")
     p.add_argument("--show_camera", action="store_true")
     p.add_argument("--loops", type=int, default=0, help="0 = infinite")
-    p.add_argument("--half_size", type=float, default=SQUARE_HALF_SIZE)
+    p.add_argument("--half_size", type=float, default=SQUARE_HALF_SIZE,
+                   help=f"Square half-edge in meters (default: {SQUARE_HALF_SIZE})")
+    p.add_argument("--tiny", action="store_true",
+                   help=f"Shortcut for --half_size {TINY_HALF_SIZE} (2 cm square). "
+                   "Use when the default size leaves the IK-friendly region "
+                   "around the seed joint config.")
     p.add_argument("--steps_per_edge", type=int, default=STEPS_PER_EDGE)
     p.add_argument("--fps", type=float, default=COMMAND_HZ)
     p.add_argument("--plane", type=str, default="yz", choices=["yz", "xy"],
                    help="Camera-local plane in which to trace the square (default: yz)")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.tiny:
+        args.half_size = TINY_HALF_SIZE
+    return args
 
 
 def main():
@@ -203,10 +217,25 @@ def main():
                 ))
 
                 if i % (args.steps_per_edge // 4) == 0:
-                    pos, _, _ = get_ee_pose(arm_stub)
+                    pos, r6d, joints = get_ee_pose(arm_stub)
+                    # Log EE pose + measured joints. The third column of R is the
+                    # camera optical axis in world; if it drifts edge-to-edge,
+                    # orientation is not being held. The wrist joints (indices
+                    # 4, 5, 6 = wrist_yaw, wrist_roll, wrist_pitch) tell us
+                    # whether the arm is yawing the wrist to satisfy position.
+                    R = np.array([
+                        [r6d[0], r6d[3]],
+                        [r6d[1], r6d[4]],
+                        [r6d[2], r6d[5]],
+                    ])
+                    optical = np.cross(R[:, 0], R[:, 1])  # third col = optical axis
                     logger.info(
                         f"  loop {loop_idx} step {i:>4d}/{total_steps}: "
-                        f"EE [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}]"
+                        f"EE [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] "
+                        f"optical [{optical[0]:+.2f}, {optical[1]:+.2f}, {optical[2]:+.2f}] "
+                        f"wrist_yaw={np.rad2deg(joints[4]):+6.1f}° "
+                        f"wrist_roll={np.rad2deg(joints[5]):+6.1f}° "
+                        f"wrist_pitch={np.rad2deg(joints[6]):+6.1f}°"
                     )
 
                 elapsed = time.perf_counter() - t0
