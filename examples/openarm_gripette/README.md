@@ -51,6 +51,63 @@ The SLAM reference frame has an arbitrary origin but is gravity-aligned. Since t
 policy uses **delta actions**, the unknown origin doesn't matter — only the direction
 and magnitude of movements are learned.
 
+> **Recorded pose = camera SE(3) pose**, not Quest controller pose. The Grabette
+> hardware records the Quest controller's pose; an offline calibration step
+> (`grabette-data/scripts/batch_transform_quest.py` using
+> `config/quest_to_camera_calibration.json`) applies the rigid controller→camera
+> transform so the dataset's `observation.pose` is the *camera* frame. Skipping
+> that step is the most common cause of a model that approaches the cube but
+> misses by a consistent rotation/offset. See `GUIDE_REAL.md` step 1.
+
+### Frame Convention (the most important section)
+
+Every position/rotation delta in the entire pipeline — dataset, training,
+sim eval, real eval, the cartesian smoke tests — lives in the **camera's local
+frame at time t**, never in the world frame.
+
+Concretely, given a per-frame camera pose `(pos[t], R[t])` in the recording's
+Z-up world frame, the dataset's 11D action is built as:
+
+```python
+delta_pos_world = pos[t+1] - pos[t]
+action[t, :3]   = R[t].T @ delta_pos_world          # camera-LOCAL position delta
+R_delta         = R[t].T @ R[t+1]                   # camera-LOCAL rotation delta
+action[t, 3:9]  = rotation_matrix_to_rotation_6d_numpy(R_delta)
+action[t, 9:]   = gripper_joints[t+1]               # gripper is absolute
+```
+
+At deployment, the gRPC `SendCartesianDelta` integrator on the server side
+(`arm_servicer.py` in sim, `grpc_server_real.py` on real) inverts this with
+the **integrator's current target** `(_target_pos, _target_r6d)`:
+
+```python
+R_target = rotation_6d_to_matrix(self._target_r6d)
+self._target_pos = self._target_pos + R_target @ delta_pos_local   # back to world
+self._target_r6d = rotation_matrix_to_6d(R_target @ R_delta_local)
+# IK to the new (target_pos, target_r6d) and command the arm joints.
+```
+
+Why this matters: the SLAM world frame has an arbitrary horizontal yaw at each
+recording session (and the robot's world frame has yet another orientation).
+World-frame deltas point in different physical directions across sessions, so
+a model trained on world deltas appears to work in sim (single fixed yaw) but
+sends the real arm "the wrong way". Camera-local deltas are session-invariant:
+they describe motion *relative to what the camera sees*, which is consistent
+across sessions by construction.
+
+**Failure signature** if this convention is violated anywhere in the chain:
+the arm moves in a consistent but visibly wrong direction on real hardware
+while passing sim eval at the same metrics. Use `cartesian_square.py` (the
+gRPC-client version in this directory) as the canonical end-to-end smoke
+test — its docstring lists what scene motion you should see on the camera
+feed for each edge.
+
+> **Two scripts with the same name**. There is also a
+> `examples/cartesian_square.py` inside `openarm_gripette_simu/` which spawns
+> its **own** standalone MuJoCo simulation and does NOT connect to any gRPC
+> server. Don't confuse it with the one here — only the version in *this*
+> directory tests the deployment delta convention.
+
 ### State and Action Space
 
 **Actions** are 11-dimensional (pre-computed as deltas in the dataset):
@@ -131,18 +188,21 @@ examples/openarm_gripette/
     offline_replay.py      # Replay recorded episodes through the policy, compare predictions vs GT
     read_arm_state.py      # Print the live arm state (joints + EE pose) from ArmService
     view_camera.py         # Display the Gripette camera feed in an OpenCV window
-    cartesian_square.py    # Move the EE along a 20×20 cm square (pipeline smoke test)
+    cartesian_square.py    # gRPC-client smoke test — square in the CAMERA-LOCAL frame
+                           # (canonical test of the deployment delta convention)
     cartesian_sinusoid.py  # Clean sinusoidal Cartesian motion — isolates pipeline vs policy jerk
     set_arm_pose.py        # Smoothly move the arm to a specified single joint configuration
     reset_arm.py           # Multi-waypoint safe reset (visits joint configs in sequence)
 
     # --- Closed-loop evaluation (simulator or real robot) ---
-    eval_simulator.py      # Continuous inference via gRPC (works with sim OR real-robot server)
+    eval_simulator.py      # Continuous inference via gRPC — sim defaults
     evaluate.py            # Episode-based evaluation with reset + success tracking
+    eval_on_robot.py       # Continuous inference via gRPC — real-robot defaults
+                           # (slim wrapper that imports helpers from eval_simulator.py;
+                           # identical control path, stricter safety defaults)
 
     # --- Real robot deployment ---
     grpc_server_real.py    # gRPC server driving a real OpenArm via CAN — same API as simulator
-    eval_on_robot.py       # Alternative: direct deployment with placo FK/IK (no gRPC server)
 ```
 
 ## Prerequisites
@@ -431,20 +491,34 @@ Why this is clean:
 - Decouples GPU (for inference) from the robot controller.
 - `set_arm_pose.py` uses the `Reset` RPC (smooth interpolation) to home the arm before runs.
 
-#### Option B: Direct deployment (no gRPC server)
+#### Option B: `eval_on_robot.py` — same gRPC architecture, real-robot defaults
 
-If you prefer a single-process pipeline (inference + FK/IK + CAN on the same machine):
+`eval_on_robot.py` is the canonical entry point for real-robot evaluation. It
+is structurally identical to `eval_simulator.py` (sibling import of the camera
+reader, async gripper sender, and `compute_relative_state` helpers) and uses
+the exact same `SendCartesianDelta` → server integrator path. The only
+differences are:
+
+- `--action_scale 0.5`, `--ood_delta_mm 8.0`, `--duration 20.0` as defaults.
+- `--arm_addr` and `--gripper_addr` are required (no `localhost` default).
+- `--gripper_async` is on by default.
+- A safety banner + 1 s delay before the loop starts.
 
 ```bash
 uv run python examples/openarm_gripette/eval_on_robot.py \
     --checkpoint outputs/gripette/run_001/best \
-    --urdf path/to/openarm.urdf \
-    --can_port can0 --side right \
-    --duration 30
+    --arm_addr <robot-ip>:50052 \
+    --gripper_addr <gripette-ip>:50051 \
+    --duration 20
 ```
 
-This script uses `placo` for FK/IK directly and talks to the motors via CAN — no gRPC
-hop. Simpler to debug but duplicates the logic that's in `grpc_server_real.py`.
+> Historical note: an earlier version of this script ran local `placo` FK/IK
+> and treated the policy's 9D Cartesian output as an *absolute* SE(3) target.
+> That bypassed the integrator and was the root cause of poor real-robot
+> grasps even when sim eval looked correct (the dataset's actions are
+> *camera-local deltas*, not absolute poses — see "Frame Convention" above).
+> The current script is delta-based and goes through `grpc_server_real.py`
+> exactly like `eval_simulator.py`.
 
 ### Sharing Models
 

@@ -10,6 +10,15 @@ For real-hardware deployment, see [`GUIDE_REAL.md`](GUIDE_REAL.md).
 
 For design rationale, see [`README.md`](README.md).
 
+> **Frame convention.** Position/rotation deltas everywhere in this pipeline
+> (dataset → policy → `SendCartesianDelta`) are **camera-local at time t**.
+> The simulator collector already produces them in that frame, so nothing
+> special is needed here — but if you ever want to verify the integrator
+> end-to-end (e.g. after touching `arm_servicer.py` or the URDF camera
+> site), run `cartesian_square.py` against the running sim server and
+> check the camera feed (see step 4.5 below). The math is in
+> [`README.md`](README.md) → "Frame Convention".
+
 ---
 
 ## Prerequisites
@@ -190,6 +199,27 @@ action vector. Use it to diagnose:
   (often a state-shortcut or OOD initial config).
 - Predicted gripper drifts only when expected (close phase, lift). Drift
   in approach phase = compounding artifact, usually a dataset issue.
+
+### Terminal 2 — camera-local smoke test (optional, integrator check)
+
+If you've recently touched the sim's `arm_servicer.py`, the URDF camera-site
+definition, or the rotation utilities, run a sanity check that the integrator
+still consumes camera-local deltas correctly:
+
+```bash
+uv run python examples/openarm_gripette/cartesian_square.py \
+    --arm_addr localhost:50052 --gripper_addr localhost:50051 \
+    --show_camera --loops 1
+```
+
+The camera feed should zoom out → scroll down → zoom in → scroll up, one
+edge at a time. If it doesn't (e.g. you see world-frame translation), the
+integrator has regressed — fix it before trusting any eval numbers.
+
+> The standalone `examples/cartesian_square.py` *inside the simulator repo*
+> is a different script — it spawns its own MuJoCo simulation and does NOT
+> connect to the running gRPC server. Use the one in this directory for the
+> deployment-pipeline test.
 
 ### Terminal 2 — multi-episode quantitative eval
 

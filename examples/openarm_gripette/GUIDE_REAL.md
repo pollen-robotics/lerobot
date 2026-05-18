@@ -8,6 +8,19 @@ without hardware), see [`GUIDE_SIM.md`](GUIDE_SIM.md).
 
 For design rationale, see [`README.md`](README.md).
 
+> **Frame convention (read once, internalize).** Every position/rotation
+> delta in this pipeline — in the dataset, in the policy output, and on the
+> wire via `SendCartesianDelta` — is in the **camera-local frame at time t**,
+> never in the world frame. The dataset's `observation.pose` must be the
+> *camera* SE(3) (Z-up world). The Grabette device tracks the **Quest
+> controller**, not the camera, so `grabette-data` must apply the
+> controller→camera calibration (`config/quest_to_camera_calibration.json`,
+> applied by `batch_transform_quest.py` / `transform_quest_trajectory.py`) to
+> produce `camera_trajectory.csv`. Skipping that step is the most common
+> cause of a model that *almost* works on the real arm — see
+> `README.md` → "Frame Convention". After deploying, the one-minute sanity
+> check is step **5.4** below.
+
 ---
 
 ## Prerequisites
@@ -94,13 +107,36 @@ demos can go anywhere; the arm can't.
 ### Pose convention
 
 Recorded poses must be **camera-site SE(3) in a Z-up gravity-aligned world
-frame** — what the iPhone SLAM gives you. Confirm before bulk recording.
-Capture 5 demos and verify:
+frame**. There are two recording stacks:
+
+- **Camera SLAM** (iPhone, RPi+IMU, OAK-D, …): the SLAM trajectory IS the
+  camera-site pose. Use directly.
+- **Quest controller** (Grabette quest-branch device): the Quest tracks the
+  **controller**, not the camera. The mounting of the controller on the
+  Grabette body is a fixed but non-trivial rigid transform. You must apply
+  the controller→camera calibration before downstream conversion:
+  ```bash
+  # In grabette-data/, on the quest branch:
+  uv run python scripts/batch_transform_quest.py \
+      -i ~/data/dataset \
+      -c config/quest_to_camera_calibration.json
+  ```
+  This writes `camera_trajectory.csv` per episode. If `camera_trajectory.csv`
+  does not exist after this step, downstream conversion will silently use
+  `r_hand_traj.json` directly and your dataset will be in the *controller*
+  frame — that's the regression behind almost-but-not-quite-working real
+  deployments.
+
+Confirm before bulk recording. Capture 5 demos and verify:
 
 - `action[:, 2]` (dz) trends negative during approach phase.
 - `action[:, 9:11]` (gripper) goes from open (~0) to closed (~-1.5, -2.1)
   exactly once per normal episode.
 - No huge spikes (would indicate SLAM tracking loss).
+- After conversion: `R[t][:, 2]` (third column of the per-frame rotation
+  matrix in the dataset) should point in the direction the camera is
+  *looking* at frame t (the optical axis, OpenCV convention). If it points
+  somewhere else, the controller→camera calibration was missed or wrong.
 
 ### Validation cadence
 
@@ -203,12 +239,17 @@ Three sides, each on their own machine (or co-located):
  │  Inference PC    │    │   Robot controller PC   │   │  Gripette (Pi)   │
  │  (GPU)           │    │                         │   │                  │
  │                  │    │  grpc_server_real.py    │   │  GripperService  │
- │  eval_simulator  ├───►│  ArmService :50052      │   │  :50051          │
- │      .py         │    │  CAN bus → OpenArm      │   │  camera + motors │
+ │ eval_on_robot.py ├───►│  ArmService :50052      │   │  :50051          │
+ │                  │    │  CAN bus → OpenArm      │   │  camera + motors │
  │                  │    │                         │   │                  │
  │                  ├──────────────────────────────────►                  │
  └──────────────────┘    └─────────────────────────┘   └──────────────────┘
 ```
+
+The arm-side server (`grpc_server_real.py`) runs an integrator that interprets
+every incoming `(dx, dy, dz, dr6d)` as a **camera-local** delta, exactly like
+the simulator's `arm_servicer.py`. The same policy checkpoint runs against
+both — see `README.md` → "Frame Convention" for the math.
 
 ### 5.1 — On the robot controller PC: start the arm server
 
@@ -254,33 +295,80 @@ Otherwise, a single-pose reset is enough:
 uv run python examples/openarm_gripette/set_arm_pose.py --arm_addr <ARM_PC_IP>:50052 --joints_deg 0 0 0 90 0 0 0
 ```
 
-### 5.4 — First policy run (slow, safe defaults)
+### 5.4 — Cartesian-square smoke test (do this before any policy run)
+
+Before sending policy actions to a real arm, verify the deployment delta
+convention end-to-end. `cartesian_square.py` traces a 10 cm square *in the
+camera-local frame* with the orientation locked (it sends identity `R_delta`
+every step), so what you observe on the camera feed unambiguously tells you
+whether the integrator is consuming the deltas correctly.
 
 ```bash
-uv run python examples/openarm_gripette/eval_simulator.py --checkpoint <USER>/<MODEL_NAME> --arm_addr <ARM_PC_IP>:50052 --gripper_addr <GRIPETTE_IP>:50051 --device cuda --gripper_async --action_scale 0.5 --duration 30
+# From the inference machine, with grpc_server_real.py already running on
+# the robot side (5.1) and the Gripette serving its camera (5.2):
+uv run python examples/openarm_gripette/cartesian_square.py \
+    --arm_addr <ARM_PC_IP>:50052 \
+    --gripper_addr <GRIPETTE_IP>:50051 \
+    --show_camera \
+    --plane yz \
+    --loops 1
 ```
 
-- `--gripper_async` — required. Keeps the control loop at 10 Hz despite
-  the slow Gripette RPC.
+What you should see on the camera feed, in order (defaults, `--plane yz`):
+
+| Edge | Local delta | Camera motion | Scene motion in image |
+| --- | --- | --- | --- |
+| 1 | `Δ = (0, 0, -step)` | backwards along the optical axis | zoom **OUT** |
+| 2 | `Δ = (0, -step, 0)` | along image-up (camera goes up) | scroll **DOWN** |
+| 3 | `Δ = (0, 0, +step)` | forwards along the optical axis | zoom **IN** |
+| 4 | `Δ = (0, +step, 0)` | along image-down (camera goes down) | scroll **UP** |
+
+If you see this, the camera-local integrator is wired correctly and the policy
+will deploy with the same frame the dataset was trained on. If you see
+world-frame motion instead (e.g. the arm always slides in the same horizontal
+direction regardless of where it is pointing), the integrator has reverted to
+world-frame deltas or the URDF's camera-site definition is wrong — fix it
+before running a policy.
+
+> Don't confuse this script with `openarm_gripette_simu/examples/cartesian_square.py`
+> in the simulator repo, which spawns its own MuJoCo simulation and ignores
+> any gRPC server.
+
+### 5.5 — First policy run (slow, safe defaults)
+
+```bash
+uv run python examples/openarm_gripette/eval_on_robot.py \
+    --checkpoint <USER>/<MODEL_NAME> \
+    --arm_addr <ARM_PC_IP>:50052 \
+    --gripper_addr <GRIPETTE_IP>:50051 \
+    --device cuda \
+    --action_scale 0.5 \
+    --ood_delta_mm 8.0 \
+    --duration 20
+```
+
+`eval_on_robot.py` is the real-robot entry point. It is structurally
+identical to `eval_simulator.py` (same `SendCartesianDelta` path, same
+`CameraStreamReader` and async gripper sender, imported as a sibling module)
+with stricter defaults for safety. The same checkpoint works in both.
+
 - `--action_scale 0.5` — halves commanded Cartesian speed. Start here,
   ramp up once you trust the behavior.
-- `--duration 30` — 30 s is enough for a full grasp attempt.
+- `--ood_delta_mm 8.0` — zero out predictions whose `|Δpos|` exceeds 8 mm;
+  halt the loop after 3 consecutive OOD steps.
+- `--gripper_async` (default ON) — keeps the loop at the target FPS despite
+  slow Gripette RPCs.
+- `--duration 20` — long enough for a full grasp attempt.
 
-Watch the log:
-
-- `total` per step should stay < 100 ms (10 Hz).
-- `grip` should be 0 ms (async sender).
-- `cart` should be 20-50 ms. Sustained 100+ ms = CAN contention.
-- `delta` column shows commanded motion magnitude per step.
-
-### 5.5 — If motion looks wrong
+### 5.6 — If motion looks wrong
 
 | Symptom | Most likely cause | Fix |
 | --- | --- | --- |
 | Arm moves too fast, scary | Action scale too high | Drop `--action_scale 0.5 → 0.3` |
 | Jerky at 10 Hz buzz | Motor interpolator tuning | Server: `--interp_alpha 0.2` (more smoothing) |
 | Arm drifts / ignores object | State-shortcut or bad camera framing | Verify `probe_model.py`; check camera matches training |
-| Control loop runs at < 5 Hz | Gripper RPC blocking | Make sure `--gripper_async` is set |
+| Control loop runs at < 5 Hz | Gripper RPC blocking | `--gripper_async` is on by default in `eval_on_robot.py`; verify it isn't disabled |
+| Arm motion looks "approximately right" but consistently misses | Frame-convention break (controller-frame deltas leaked into deployment, or `R_FK_TO_SLAM` is non-identity but shouldn't be) | Run **5.4 cartesian_square smoke test** — fix the integrator before retrying the policy |
 | `SendCartesianDelta` timeouts | CAN bus saturation | Lower `--interp_hz 25` on the server |
 | Closes gripper way above the object | Depth-perception failure (sparse data, no negative examples) | Re-record with more **hover** episodes; larger dataset |
 | Doesn't reopen after a missed grasp | Training data lacks closed→open transitions | Re-record with **release** episodes (~15%) |
@@ -301,8 +389,18 @@ uv run python examples/openarm_gripette/train.py --dataset_repo_id ... --push_to
 # 2. verify offline
 uv run python examples/openarm_gripette/offline_replay.py --checkpoint ...
 
-# 3. on the robot
+# 3. on the robot — start servers
 uv run python examples/openarm_gripette/grpc_server_real.py --can_port can0 --side right &
-uv run python examples/openarm_gripette/reset_arm.py --arm_addr ...
-uv run python examples/openarm_gripette/eval_simulator.py --checkpoint ... --gripper_async --action_scale 0.5
+uv run python examples/openarm_gripette/reset_arm.py --arm_addr <ARM_IP>:50052
+
+# 4. smoke-test the integrator (camera-local square) BEFORE running the policy
+uv run python examples/openarm_gripette/cartesian_square.py \
+    --arm_addr <ARM_IP>:50052 --gripper_addr <GRIPETTE_IP>:50051 \
+    --show_camera --loops 1
+
+# 5. run the policy
+uv run python examples/openarm_gripette/eval_on_robot.py \
+    --checkpoint <USER>/<MODEL> \
+    --arm_addr <ARM_IP>:50052 --gripper_addr <GRIPETTE_IP>:50051 \
+    --action_scale 0.5 --ood_delta_mm 8.0
 ```

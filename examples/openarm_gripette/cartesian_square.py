@@ -1,24 +1,41 @@
-"""Move the arm end-effector along a 20cm x 20cm square in Cartesian space.
+"""Move the EE in a square pattern using camera-LOCAL frame deltas.
 
-gRPC equivalent of the `cartesian_square.py` example in `openarm_gripette_simu`.
-Works with the simulator OR the real robot — just change the `--arm_addr`.
+This is the canonical end-to-end test of the camera-local delta convention
+exposed by `arm_servicer.SendCartesianDelta` (sim) and
+`grpc_server_real.SendCartesianDelta` (real). The server's integrator is:
 
-The end-effector traces a square in the YZ plane while keeping orientation fixed.
-Uses the `SendCartesianDelta` RPC — no local IK required (the server handles it).
+    R_target_new   = R_target @ R_delta            (orientation)
+    pos_target_new = pos_target + R_target @ Δpos  (position; LOCAL → world)
 
-Orientation is actively locked: at each step, the script reads the current EE
-rotation, computes a 6D delta that would restore the initial rotation, and sends
-that as the rotation delta. This counteracts the small orientation drift that
-would otherwise accumulate from IK soft-constraint slack.
+So `(dx, dy, dz)` is interpreted in the integrator's current camera frame,
+NOT in world coordinates. To trace a clean shape with this script you read
+the camera's local frame the same way the policy does, and send deltas
+defined directly in that frame.
+
+What the square traces (defaults):
+  - Plane:     camera-local YZ plane  (image-down × optical-axis)
+  - Orientation:    locked to start orientation (R_delta = identity every step)
+
+Visual verification on the camera feed:
+  - Edge 1 (camera moves -Z = backward along optical axis): scene zooms OUT.
+  - Edge 2 (camera moves -Y = image-up): scene scrolls DOWN.
+  - Edge 3 (camera moves +Z = forward along optical axis): scene zooms IN.
+  - Edge 4 (camera moves +Y = image-down): scene scrolls UP.
+
+If you instead see world-frame motion (e.g. always moves in the same horizontal
+direction regardless of camera tilt), the integrator has reverted to world-
+frame deltas — that's the regression the camera-local refactor was meant to
+fix. See `feedback_action_deltas_camera_local` in memory.
 
 Usage:
   uv run python examples/openarm_gripette/cartesian_square.py \\
       --arm_addr localhost:50052
-
-  # With camera display from the Gripette:
   uv run python examples/openarm_gripette/cartesian_square.py \\
-      --arm_addr localhost:50052 \\
-      --gripper_addr localhost:50051 --show_camera
+      --arm_addr <robot-ip>:50052 --gripper_addr <gripette-ip>:50051 --show_camera
+
+  # Optional: trace the square in the camera-local XY plane (image-right ×
+  # image-down) instead of the default YZ plane.
+  uv run python examples/openarm_gripette/cartesian_square.py --plane xy
 """
 
 import argparse
@@ -29,148 +46,74 @@ import time
 import grpc
 import numpy as np
 from openarm_gripette_simu.proto import arm_pb2, arm_pb2_grpc
-from openarm_gripette_simu.rotation import rotation_6d_to_matrix
 
 logger = logging.getLogger(__name__)
 
-
-def get_ee_pose(arm_stub) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Fetch the current EE position (3,), 6D rotation (6,), and joint positions (7,)."""
-    state = arm_stub.GetArmState(arm_pb2.GetArmStateRequest())
-    pos = np.array([state.x, state.y, state.z], dtype=np.float64)
-    r6d = np.array(state.r6d, dtype=np.float64)
-    joints = np.array(state.joint_positions, dtype=np.float64)
-    return pos, r6d, joints
-
-
-def rotation_angle_deg(r6d_a: np.ndarray, r6d_b: np.ndarray) -> float:
-    """Actual rotation angle in degrees between two 6D-encoded rotations.
-
-    Uses R_err = R_a @ R_b^T and reads the rotation angle from the trace.
-    """
-    R_a = rotation_6d_to_matrix(r6d_a)
-    R_b = rotation_6d_to_matrix(r6d_b)
-    R_err = R_a @ R_b.T
-    # Rotation angle from R: acos((trace - 1) / 2), clipped for numerical safety
-    cos_theta = (np.trace(R_err) - 1.0) / 2.0
-    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-    return float(np.rad2deg(np.arccos(cos_theta)))
-
-
-def compute_orientation_correction(
-    current_r6d: np.ndarray, target_r6d: np.ndarray, gain: float = 1.0
-) -> np.ndarray:
-    """Compute a 6D rotation delta to restore the target orientation.
-
-    The server's SendCartesianDelta does `target_r6d += delta_r6d`, so sending
-    (target - current) * gain nudges the orientation back toward target.
-
-    Args:
-        current_r6d: current orientation (6D).
-        target_r6d: desired fixed orientation (6D).
-        gain: proportional gain (1.0 = full correction each step; lower = softer).
-
-    Returns:
-        6D rotation delta to send.
-    """
-    return (target_r6d - current_r6d) * gain
-
-
-# Square geometry — kept small for a safer first test on hardware.
-# Original simulator example uses 0.10 (20cm square); 0.05 (10cm) is safer to start.
-SQUARE_HALF_SIZE = 0.05
-
-# Motion parameters (conservative for real hardware: ~1mm per step, slow loop rate).
-# At 20Hz with 200 steps/edge, each edge takes 10s → full square = 40s per loop.
-# Per-step delta = 2 * half_size / steps_per_edge = 0.10 / 200 = 0.5mm (very safe).
-STEPS_PER_EDGE = 200
-COMMAND_HZ = 20
+# Identity rotation in 6D = first two columns of I_3.
+# Sending this as `dr6d` makes the server's integrator apply
+# `R_target_new = R_target @ I = R_target` — i.e. orientation stays locked
+# at whatever the integrator was initialised to (FK at startup or after Reset).
+IDENTITY_R6D = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 # Hard cap on per-step displacement for safety (meters).
-# If the computed step exceeds this, the script raises before sending any command.
 MAX_PER_STEP_MM = 2.0
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Cartesian square trajectory via gRPC")
-    p.add_argument("--arm_addr", type=str, default="localhost:50052", help="ArmService gRPC address")
-    p.add_argument("--gripper_addr", type=str, default="localhost:50051", help="GripperService address")
-    p.add_argument("--show_camera", action="store_true", help="Display the gripper camera feed")
-    p.add_argument("--loops", type=int, default=0, help="Number of square loops (0 = infinite)")
-    p.add_argument(
-        "--half_size",
-        type=float,
-        default=SQUARE_HALF_SIZE,
-        help="Half-edge of the square in meters (default: 0.10 = 20cm square)",
-    )
-    p.add_argument(
-        "--steps_per_edge",
-        type=int,
-        default=STEPS_PER_EDGE,
-        help="Number of small deltas per edge (more = smoother but slower)",
-    )
-    p.add_argument("--fps", type=float, default=COMMAND_HZ, help="Control loop rate in Hz")
-    p.add_argument(
-        "--orient_gain",
-        type=float,
-        default=0.3,
-        help="Proportional gain for orientation correction (0 = no lock, 1 = full correction each step)",
-    )
-    return p.parse_args()
+# Square geometry — small and slow for a safe first test.
+SQUARE_HALF_SIZE = 0.05      # 5 cm half-edge → 10 cm square
+STEPS_PER_EDGE = 200         # 0.5 mm per step at default
+COMMAND_HZ = 20              # 200 steps × 1/20 s = 10 s per edge
 
 
-def build_square_deltas(half: float, steps_per_edge: int) -> list[tuple[float, float, float]]:
-    """Generate per-step (dx, dy, dz) deltas that trace a square in the YZ plane.
+def get_ee_pose(arm_stub) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fetch FK pose (pos, r6d) and arm joints (rad) from the server.
 
-    Square corners (relative to the starting center):
-      +Y +Z   →   +Y -Z   →   -Y -Z   →   -Y +Z   →   back to start
-
-    Each edge is divided into `steps_per_edge` small deltas.
+    NB: this is the server's FK-from-measured-joints reading, not the
+    integrator's internal `_target_pos/_target_r6d`. We only use it for
+    logging / sanity checks. The integrator is what actually drives motion.
     """
-    # Edge deltas (full-edge displacement = 2 * half)
-    edge_len = 2 * half
-    step = edge_len / steps_per_edge
+    state = arm_stub.GetArmState(arm_pb2.GetArmStateRequest())
+    return (np.array([state.x, state.y, state.z], dtype=np.float64),
+            np.array(state.r6d, dtype=np.float64),
+            np.array(state.joint_positions, dtype=np.float64))
 
-    edges = [
-        (0.0, 0.0, -step),  # top-right → bottom-right: move -Z
-        (0.0, -step, 0.0),  # bottom-right → bottom-left: move -Y
-        (0.0, 0.0, +step),  # bottom-left → top-left: move +Z
-        (0.0, +step, 0.0),  # top-left → top-right: move +Y
-    ]
+
+def build_square_local_deltas(half: float, steps_per_edge: int, plane: str) -> list[tuple[float, float, float]]:
+    """Per-step (dx, dy, dz) in the camera-LOCAL frame, tracing a closed square.
+
+    Plane:
+      yz  → camera-local YZ plane (image-down × optical-axis): forward/back × up/down
+      xy  → camera-local XY plane (image-right × image-down): horizontal in the image
+    """
+    step = 2 * half / steps_per_edge
+    if plane == "yz":
+        edges = [
+            (0.0, 0.0, -step),  # along -Z (optical axis, backward) → scene zooms OUT
+            (0.0, -step, 0.0),  # along -Y (image-up) → scene scrolls DOWN
+            (0.0, 0.0, +step),  # along +Z (forward) → scene zooms IN
+            (0.0, +step, 0.0),  # along +Y (image-down) → scene scrolls UP
+        ]
+    elif plane == "xy":
+        edges = [
+            (+step, 0.0, 0.0),  # along +X (image-right) → scene scrolls LEFT
+            (0.0, +step, 0.0),  # along +Y (image-down) → scene scrolls UP
+            (-step, 0.0, 0.0),  # along -X (image-left) → scene scrolls RIGHT
+            (0.0, -step, 0.0),  # along -Y (image-up) → scene scrolls DOWN
+        ]
+    else:
+        raise ValueError(f"Unknown plane: {plane!r} (expected 'yz' or 'xy')")
 
     deltas = []
     for edge in edges:
-        for _ in range(steps_per_edge):
-            deltas.append(edge)
+        deltas.extend([edge] * steps_per_edge)
     return deltas
 
 
-def send_move_to_start(
-    arm_stub, half: float, steps: int, dt: float, target_r6d: np.ndarray, orient_gain: float
-):
-    """Move from the current pose to the top-right corner of the square.
-
-    Half-edge in +Y and +Z, divided into `steps` small deltas. At each step,
-    computes a rotation delta to keep the orientation locked to `target_r6d`.
-    """
-    dy = half / steps
-    dz = half / steps
-
-    for _ in range(steps):
-        _, current_r6d, _ = get_ee_pose(arm_stub)
-        dr6d = compute_orientation_correction(current_r6d, target_r6d, orient_gain)
-        arm_stub.SendCartesianDelta(arm_pb2.CartesianDelta(dx=0.0, dy=dy, dz=dz, dr6d=dr6d.tolist()))
-        time.sleep(dt)
-
-
 def camera_display_thread(gripper_addr: str, stop_event: threading.Event):
-    """Show the gripper camera feed in an OpenCV window (optional)."""
     import cv2
     from openarm_gripette_simu.proto import gripper_pb2, gripper_pb2_grpc
 
     channel = grpc.insecure_channel(gripper_addr)
     stub = gripper_pb2_grpc.GripperServiceStub(channel)
-
     try:
         for frame in stub.StreamState(gripper_pb2.StreamRequest()):
             if stop_event.is_set():
@@ -188,88 +131,91 @@ def camera_display_thread(gripper_addr: str, stop_event: threading.Event):
         cv2.destroyAllWindows()
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Trace a camera-LOCAL Cartesian square via gRPC")
+    p.add_argument("--arm_addr", type=str, default="localhost:50052")
+    p.add_argument("--gripper_addr", type=str, default="localhost:50051")
+    p.add_argument("--show_camera", action="store_true")
+    p.add_argument("--loops", type=int, default=0, help="0 = infinite")
+    p.add_argument("--half_size", type=float, default=SQUARE_HALF_SIZE)
+    p.add_argument("--steps_per_edge", type=int, default=STEPS_PER_EDGE)
+    p.add_argument("--fps", type=float, default=COMMAND_HZ)
+    p.add_argument("--plane", type=str, default="yz", choices=["yz", "xy"],
+                   help="Camera-local plane in which to trace the square (default: yz)")
+    return p.parse_args()
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args()
 
-    # ---- Safety check: per-step displacement ----
-    step_m = 2 * args.half_size / args.steps_per_edge
-    step_mm = step_m * 1000
+    # Safety check on per-step displacement.
+    step_mm = 2 * args.half_size / args.steps_per_edge * 1000
     if step_mm > MAX_PER_STEP_MM:
         raise ValueError(
             f"Per-step displacement {step_mm:.2f} mm exceeds safety limit "
-            f"({MAX_PER_STEP_MM} mm). Increase --steps_per_edge or reduce --half_size."
+            f"{MAX_PER_STEP_MM} mm. Increase --steps_per_edge or reduce --half_size."
         )
-    logger.info(f"Motion: {step_mm:.2f} mm per step @ {args.fps:.0f} Hz = {step_mm * args.fps:.1f} mm/s")
+    logger.info(
+        f"Camera-local square in '{args.plane}' plane: {step_mm:.2f} mm/step @ "
+        f"{args.fps:.0f} Hz → {step_mm * args.fps:.1f} mm/s, "
+        f"{args.steps_per_edge * 4 / args.fps:.1f} s per loop"
+    )
 
-    # ---- Connect ----
-    logger.info(f"Connecting to ArmService at {args.arm_addr}")
     channel = grpc.insecure_channel(args.arm_addr)
     arm_stub = arm_pb2_grpc.ArmServiceStub(channel)
     ping = arm_stub.Ping(arm_pb2.ArmPingRequest())
     logger.info(f"Server: {ping.status} (uptime: {ping.uptime_seconds:.1f}s)")
 
-    # ---- Optional camera display ----
     stop_event = threading.Event()
     cam_thread = None
     if args.show_camera:
-        logger.info(f"Starting camera display from {args.gripper_addr}")
         cam_thread = threading.Thread(
-            target=camera_display_thread, args=(args.gripper_addr, stop_event), daemon=True
+            target=camera_display_thread,
+            args=(args.gripper_addr, stop_event),
+            daemon=True,
         )
         cam_thread.start()
 
-    # ---- Capture starting pose (lock orientation to this) ----
-    start_pos, target_r6d, start_joints = get_ee_pose(arm_stub)
-    logger.info(f"Starting EE pos: [{start_pos[0]:+.3f}, {start_pos[1]:+.3f}, {start_pos[2]:+.3f}] m")
-    logger.info(f"Starting joints (rad): {start_joints.round(3).tolist()}")
-    logger.info(f"Target orientation locked to: {target_r6d.round(3).tolist()}")
+    # Log the starting pose. We do NOT rotate deltas through it — the server
+    # already applies its own integrator rotation `R_target @ Δpos`. Reading
+    # the FK pose here is just for the human operator's situational awareness.
+    start_pos, start_r6d, start_joints = get_ee_pose(arm_stub)
+    logger.info(f"Start EE position (world): "
+                f"[{start_pos[0]:+.3f}, {start_pos[1]:+.3f}, {start_pos[2]:+.3f}] m")
+    logger.info(f"Start joints (rad): {start_joints.round(3).tolist()}")
+    logger.info("Orientation will be locked (sending identity R_delta every step).")
 
+    deltas = build_square_local_deltas(args.half_size, args.steps_per_edge, args.plane)
+    total_steps = len(deltas)
     dt = 1.0 / args.fps
-    orient_gain = args.orient_gain
 
     try:
-        # ---- Move to top-right corner (square start) ----
-        logger.info(f"Moving to square start corner (+{args.half_size * 100:.0f}cm in Y and Z)")
-        send_move_to_start(arm_stub, args.half_size, args.steps_per_edge, dt, target_r6d, orient_gain)
-
-        # ---- Build + loop the square deltas ----
-        deltas = build_square_deltas(args.half_size, args.steps_per_edge)
-        total_steps = len(deltas)
-        period_s = total_steps * dt
-        logger.info(f"Running square loop: {total_steps} steps per loop, ~{period_s:.1f}s per loop")
-
         loop_idx = 0
         while not stop_event.is_set():
             for i, (dx, dy, dz) in enumerate(deltas):
                 if stop_event.is_set():
                     break
-                loop_start = time.perf_counter()
+                t0 = time.perf_counter()
 
-                # Read current state, compute rotation correction to keep orientation fixed
-                current_pos, current_r6d, current_joints = get_ee_pose(arm_stub)
-                dr6d = compute_orientation_correction(current_r6d, target_r6d, orient_gain)
-
-                arm_stub.SendCartesianDelta(arm_pb2.CartesianDelta(dx=dx, dy=dy, dz=dz, dr6d=dr6d.tolist()))
+                arm_stub.SendCartesianDelta(arm_pb2.CartesianDelta(
+                    dx=dx, dy=dy, dz=dz, dr6d=IDENTITY_R6D,
+                ))
 
                 if i % (args.steps_per_edge // 4) == 0:
-                    # Proper rotation angle in degrees (much more interpretable)
-                    angle_deg = rotation_angle_deg(target_r6d, current_r6d)
-                    # Wrist roll drift in degrees (joint 5 = r_wrist_roll)
-                    wrist_roll_deg = np.rad2deg(current_joints[5] - start_joints[5])
+                    pos, _, _ = get_ee_pose(arm_stub)
                     logger.info(
                         f"  loop {loop_idx} step {i:>4d}/{total_steps}: "
-                        f"EE [{current_pos[0]:+.3f}, {current_pos[1]:+.3f}, {current_pos[2]:+.3f}] "
-                        f"orient_err={angle_deg:.2f}° wrist_roll={wrist_roll_deg:+.2f}°"
+                        f"EE [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}]"
                     )
-                # Keep real-time pacing
-                elapsed = time.perf_counter() - loop_start
-                if (remaining := dt - elapsed) > 0:
-                    time.sleep(remaining)
+
+                elapsed = time.perf_counter() - t0
+                if elapsed < dt:
+                    time.sleep(dt - elapsed)
 
             loop_idx += 1
             if args.loops > 0 and loop_idx >= args.loops:
-                logger.info(f"Completed {args.loops} loops")
+                logger.info(f"Completed {args.loops} loop(s)")
                 break
 
     except KeyboardInterrupt:
