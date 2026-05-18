@@ -253,8 +253,21 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
                 target_tf[:3, :3] = R_target_new
                 target_tf[:3, 3] = self._target_pos
 
-                arm_joints = self._arm.get_positions()
-                target_joints = self._kin.inverse(target_tf, current_joint_positions=arm_joints)
+                # IK seed: prefer the LAST COMMANDED joint config (continuity with
+                # the previous IK solution) over the MEASURED joint config (which
+                # lags behind by the interpolator e-folding time, ~67 ms at the
+                # 50 Hz / alpha=0.3 default). Seeding from measured joints on real
+                # makes Placo's frame-task (position weight 100x orientation) flip
+                # the wrist toward whichever yaw value matches the lagged seed,
+                # which compounds into visible yaw drift edge-by-edge in
+                # cartesian_square. Sim doesn't hit this because MuJoCo position
+                # controllers track commanded joints tightly, so measured ≈
+                # commanded and the seed is already smooth.
+                if self._latest_target_joints is not None:
+                    ik_seed = self._latest_target_joints
+                else:
+                    ik_seed = self._arm.get_positions()
+                target_joints = self._kin.inverse(target_tf, current_joint_positions=ik_seed)
 
                 # Hand off to the interpolator — no direct motor write.
                 self._latest_target_joints = target_joints.copy()
