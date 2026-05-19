@@ -162,6 +162,8 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
         start_time: float,
         interp_hz: float = 50.0,
         interp_alpha: float = 0.3,
+        max_ik_jump_deg: float = 15.0,
+        max_ik_jump_violations: int = 2,
     ):
         self._arm = arm
         self._kin = kin
@@ -178,6 +180,15 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
         self._current_cmd_joints: np.ndarray | None = None
         self._interp_enabled = True
         self._interp_running = True
+
+        # IK-jump watchdog state. The threshold is per-joint per-step. A
+        # singularity-driven branch flip on a 50 Hz policy loop usually shows
+        # up as 30°+ on a single joint in one step, so 15° is a comfortable
+        # margin between "normal motion" and "abrupt flip" at typical speeds.
+        # Set <= 0 to disable.
+        self._max_ik_jump_rad = float(np.deg2rad(max_ik_jump_deg))
+        self._max_ik_jump_violations = int(max_ik_jump_violations)
+        self._ik_jump_violations = 0
 
         self._sync_target_from_robot()
 
@@ -268,6 +279,51 @@ class ArmServicer(arm_pb2_grpc.ArmServiceServicer):
                 else:
                     ik_seed = self._arm.get_positions()
                 target_joints = self._kin.inverse(target_tf, current_joint_positions=ik_seed)
+
+                # IK-jump watchdog: refuse the update if any joint would change
+                # by more than `_max_ik_jump_rad` in this single step. Singular
+                # configurations (typical wrist alignment) can make Placo flip
+                # to a different IK branch within a single inference step, and
+                # the per-joint motor clamp + interpolator only soften the speed
+                # of that flip, they don't prevent it. Comparing the new
+                # solution to the last accepted one catches the branch flip
+                # directly and trips the integrator before it propagates.
+                if self._latest_target_joints is not None and self._max_ik_jump_rad > 0:
+                    delta_joints = target_joints - self._latest_target_joints
+                    max_jump = float(np.max(np.abs(delta_joints)))
+                    if max_jump > self._max_ik_jump_rad:
+                        bad_idx = int(np.argmax(np.abs(delta_joints)))
+                        bad_name = KIN_ARM_JOINT_NAMES[bad_idx]
+                        logger.error(
+                            f"IK-jump watchdog tripped: joint '{bad_name}' "
+                            f"(idx {bad_idx}) would change by "
+                            f"{np.rad2deg(delta_joints[bad_idx]):+.1f}° in one step "
+                            f"(limit {np.rad2deg(self._max_ik_jump_rad):.1f}°). "
+                            f"Rejecting command; integrator NOT updated. "
+                            f"Likely singularity branch flip — re-home or "
+                            f"raise --max_ik_jump_deg if intentional."
+                        )
+                        self._ik_jump_violations += 1
+                        if self._ik_jump_violations >= self._max_ik_jump_violations:
+                            logger.error(
+                                f"{self._ik_jump_violations} consecutive "
+                                f"IK-jump violations — disabling interpolator "
+                                f"and reverting integrator target to last "
+                                f"FK pose for safety."
+                            )
+                            self._interp_enabled = False
+                            self._sync_target_from_robot()
+                        # Undo this Cartesian delta on the integrator so we don't
+                        # leak it into the next step's cumulative target.
+                        self._target_pos -= delta_pos_world
+                        self._target_r6d = rotation_matrix_to_6d(R_target).copy()
+                        return arm_pb2.ArmCommandResponse(
+                            success=False,
+                            error=f"IK jump on '{bad_name}': "
+                                  f"{np.rad2deg(delta_joints[bad_idx]):+.1f}°",
+                        )
+                    # Healthy step — reset the consecutive-violation counter.
+                    self._ik_jump_violations = 0
 
                 # Hand off to the interpolator — no direct motor write.
                 self._latest_target_joints = target_joints.copy()
@@ -426,6 +482,25 @@ def parse_args():
         "Typical range 0.1 (heavy smoothing, ~100ms lag at 50Hz) to 0.5 (light smoothing, ~40ms lag).",
     )
     p.add_argument(
+        "--max_ik_jump_deg",
+        type=float,
+        default=15.0,
+        help="IK-jump watchdog: max per-joint change between two consecutive "
+        "Placo IK solutions, in degrees. If any joint exceeds this in one step, "
+        "the Cartesian delta is REJECTED (integrator rolled back). This is the "
+        "specific guard against singularity-driven branch flips that the OOD "
+        "Cartesian watchdog and per-step motor clamp can't catch. "
+        "Set <= 0 to disable. Typical: 10–20°. Default: 15.",
+    )
+    p.add_argument(
+        "--max_ik_jump_violations",
+        type=int,
+        default=2,
+        help="After N consecutive IK-jump rejections, disable the interpolator "
+        "and re-sync the integrator to the current FK pose. Forces the operator "
+        "to home before further motion. Default: 2.",
+    )
+    p.add_argument(
         "--arm_joint_map",
         type=str,
         nargs="+",
@@ -504,6 +579,8 @@ def main():
         start_time,
         interp_hz=args.interp_hz,
         interp_alpha=args.interp_alpha,
+        max_ik_jump_deg=args.max_ik_jump_deg,
+        max_ik_jump_violations=args.max_ik_jump_violations,
     )
     arm_pb2_grpc.add_ArmServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{args.arm_port}")
