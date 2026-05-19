@@ -26,5 +26,19 @@ trained policy is deployed**.
 > one minute is `cartesian_square.py` (the gRPC-client copy in this
 > directory).
 
+> **Before the first run on a new physical arm.** Step **5.0** of
+> [`GUIDE_REAL.md`](GUIDE_REAL.md) covers per-arm prerequisites:
+> URDF axis sign verification (auto-generated URDFs have shipped with
+> wrong-sign axes — must be checked per joint against sim), motor-zero
+> calibration via `calibrate_arm_no_gripper.py`, and gripper open/close
+> direction check via `set_gripper_pose.py`. Skipping these is the most
+> common cause of "the arm moves but completely misses the target".
+
+> **Safety layers** for real-arm policy evals are catalogued in
+> [`GUIDE_REAL.md`](GUIDE_REAL.md) §5.5b — including the server-side
+> IK-jump watchdog that catches singularity-driven wrist explosions before
+> they happen. Use the tight-safety preset for the first run on any new
+> checkpoint.
+
 For design rationale (why 6D rotations, why delta actions, etc.), see
 [`README.md`](README.md).

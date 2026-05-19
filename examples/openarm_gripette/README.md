@@ -189,10 +189,19 @@ examples/openarm_gripette/
     read_arm_state.py      # Print the live arm state (joints + EE pose) from ArmService
     view_camera.py         # Display the Gripette camera feed in an OpenCV window
     cartesian_square.py    # gRPC-client smoke test — square in the CAMERA-LOCAL frame
-                           # (canonical test of the deployment delta convention)
+                           # (canonical test of the deployment delta convention).
+                           # Flags: --plane {yz,xy}, --tiny, --half_size, --fps,
+                           # --log_gripper_frame (adds gripper-tip FK + camera roll).
     cartesian_sinusoid.py  # Clean sinusoidal Cartesian motion — isolates pipeline vs policy jerk
     set_arm_pose.py        # Smoothly move the arm to a specified single joint configuration
+    set_gripper_pose.py    # Send goal positions to the Gripette's 2-DOF gripper motors;
+                           # supports --open / --close presets, rad or deg, --torque on/off
     reset_arm.py           # Multi-waypoint safe reset (visits joint configs in sequence)
+
+    # --- One-time-per-arm calibration ---
+    calibrate_arm_no_gripper.py  # OpenArm motor-zero calibration WITHOUT the gripper motor.
+                                 # Run with `/usr/bin/python3.14` (the system Python that has
+                                 # `openarm_can`), NOT via `uv run`.
 
     # --- Closed-loop evaluation (simulator or real robot) ---
     eval_simulator.py      # Continuous inference via gRPC — sim defaults
@@ -202,7 +211,11 @@ examples/openarm_gripette/
                            # identical control path, stricter safety defaults)
 
     # --- Real robot deployment ---
-    grpc_server_real.py    # gRPC server driving a real OpenArm via CAN — same API as simulator
+    grpc_server_real.py    # gRPC server driving a real OpenArm via CAN — same API as simulator.
+                           # Server-side safety: max_relative_target (per-step joint clamp),
+                           # IK-jump watchdog (rejects singularity-driven branch flips),
+                           # interpolator alpha (motor-command smoothing). See GUIDE_REAL.md
+                           # §5.5b for the full safety-knob table.
 ```
 
 ## Prerequisites
@@ -577,6 +590,27 @@ Closed-loop policy execution on the real arm introduces several loop-timing and
 smoothness issues that don't exist in simulation. The scripts ship with a set of
 CLI knobs for addressing each one independently.
 
+### Server-side: IK-jump watchdog (`grpc_server_real.py`)
+
+Catches singularity-driven branch flips in Placo's IK that the other safety
+layers can't. Compares each new IK solution to the previous accepted one;
+if any joint would change by more than `--max_ik_jump_deg` in a single step,
+rejects the Cartesian command, rolls back the integrator, and (after
+`--max_ik_jump_violations` consecutive rejections) disables the interpolator
+so the arm freezes. This was added after a wrist-explosion event during
+model eval where the model commanded the arm near a wrist singularity.
+
+```
+--max_ik_jump_deg 10 --max_ik_jump_violations 1   # tight (first-run safety)
+--max_ik_jump_deg 20 --max_ik_jump_violations 2   # cruise (trusted models)
+--max_ik_jump_deg 0                                # disabled (not recommended)
+```
+
+Trip log line: `IK-jump watchdog tripped: joint '<name>' would change by X° in one step`.
+On a latch (after N consecutive violations), the integrator re-syncs to the
+current FK pose and motors stop. Restart the server and re-home before
+proceeding.
+
 ### Server-side: joint-space setpoint interpolator (`grpc_server_real.py`)
 
 Policy commands arrive at ~10 Hz but MIT motor gains are stiff — without
@@ -611,8 +645,8 @@ jerk is pure server/motor/IK. See its `--help` for options.
 
 | Flag             | Default | Effect                                                                                                                             |
 | ---------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `--action_scale` | 1.0     | Multiplies Cartesian deltas (position + 6D rotation). `0.5` halves commanded speed; gripper unchanged. Trajectory shape preserved. |
-| `--fps`          | 10      | Control loop rate. Lower = slower motion + slower observation rate. Prefer `--action_scale` for speed control.                     |
+| `--action_scale` | 1.0 (sim) / 0.5 (real) | Multiplies Cartesian Δ-position. **Caveat:** also multiplies the 6D rotation Δ, but Gram-Schmidt normalizes that server-side, so the rotation Δ is *not* actually slowed. Use the server-side `--max_ik_jump_deg` watchdog for rotation safety. Gripper unchanged. |
+| `--fps`          | 10      | Control loop rate. Lower = slower motion + slower observation rate. Prefer `--action_scale` for position-speed control.            |
 
 ### Client-side: decoupling the Gripette RPC (`eval_simulator.py`)
 
