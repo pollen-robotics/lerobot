@@ -49,6 +49,23 @@ from openarm_gripette_simu.proto import arm_pb2, arm_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
+# Lazy import — only needed if --log_gripper_frame is set, and only when this
+# script is run in an env that has placo + the URDF (i.e. the lerobot env).
+_KIN = None
+
+
+def _gripper_pos_from_joints(joints: np.ndarray) -> np.ndarray:
+    """Run client-side FK on the URDF to get the gripper-frame world position
+    for the given joint angles (rad). Cached singleton Kinematics."""
+    global _KIN
+    if _KIN is None:
+        from openarm_gripette_simu import Kinematics
+        from openarm_gripette_simu.kinematics import GRIPPER_FRAME
+        _KIN = (Kinematics(), GRIPPER_FRAME)
+    kin, gframe = _KIN
+    T = kin.forward(joints, frame=gframe)
+    return T[:3, 3]
+
 # Identity rotation in 6D = first two columns of I_3.
 # Sending this as `dr6d` makes the server's integrator apply
 # `R_target_new = R_target @ I = R_target` — i.e. orientation stays locked
@@ -68,6 +85,48 @@ COMMAND_HZ = 20              # 200 steps × 1/20 s = 10 s per edge
 # square is clean but the 6 cm one isn't, the failure is geometric (the larger
 # trajectory leaves the IK-friendly region near the seed pose).
 TINY_HALF_SIZE = 0.01        # 1 cm half-edge → 2 cm square
+
+# Joint names in the order GetArmState returns them (`KIN_ARM_JOINT_NAMES`
+# in the sim's kinematics).
+JOINT_NAMES = [
+    "r_arm_pitch",   # joint_1
+    "r_arm_roll",    # joint_2
+    "r_arm_yaw",     # joint_3
+    "r_elbow",       # joint_4
+    "r_wrist_yaw",   # joint_5
+    "r_wrist_roll",  # joint_6
+    "r_wrist_pitch", # joint_7
+]
+
+# Joint limits enforced by `OpenArm7FollowerConfig.RIGHT_DEFAULT_JOINTS_LIMITS`
+# in degrees (clipped by the driver before the goal reaches the motor).
+# These are TIGHTER than the URDF mechanical limits — Placo's IK doesn't see
+# them, so a Cartesian target that requires a joint outside this range will
+# silently miss on real hardware. Sim has no such layer, which is why a
+# bigger square (e.g. half_size=0.05) can work in sim but miss on real.
+DRIVER_JOINT_LIMITS_DEG = [
+    (-75.0, 75.0),   # joint_1
+    ( -9.0, 90.0),   # joint_2  (asymmetric)
+    (-85.0, 85.0),   # joint_3
+    (  0.0, 135.0),  # joint_4
+    (-85.0, 85.0),   # joint_5
+    (-40.0, 40.0),   # joint_6  (tight)
+    (-80.0, 80.0),   # joint_7
+]
+
+# Flag a joint when its value is within this many degrees of either limit.
+JOINT_SATURATION_FLAG_DEG = 5.0
+
+
+def _saturation_flag(name: str, val_deg: float, lo: float, hi: float) -> str:
+    """Return an empty string if the joint is comfortably inside its driver
+    limits, otherwise a flag like `(j6 HI: 40.0)`."""
+    margin = JOINT_SATURATION_FLAG_DEG
+    if val_deg <= lo + margin:
+        return f"(!{name.replace('r_', '')}<{lo:+.0f})"
+    if val_deg >= hi - margin:
+        return f"(!{name.replace('r_', '')}>{hi:+.0f})"
+    return ""
 
 
 def get_ee_pose(arm_stub) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -153,6 +212,11 @@ def parse_args():
     p.add_argument("--fps", type=float, default=COMMAND_HZ)
     p.add_argument("--plane", type=str, default="yz", choices=["yz", "xy"],
                    help="Camera-local plane in which to trace the square (default: yz)")
+    p.add_argument("--log_gripper_frame", action="store_true",
+                   help="Also log the gripper-tip position (FK at the 'gripper' "
+                        "URDF frame). The IK locks the camera-site (which the "
+                        "policy uses), but you watch the gripper tip — these "
+                        "two diverge when wrist joints swing in the null space.")
     args = p.parse_args()
     if args.tiny:
         args.half_size = TINY_HALF_SIZE
@@ -197,8 +261,34 @@ def main():
     start_pos, start_r6d, start_joints = get_ee_pose(arm_stub)
     logger.info(f"Start EE position (world): "
                 f"[{start_pos[0]:+.3f}, {start_pos[1]:+.3f}, {start_pos[2]:+.3f}] m")
-    logger.info(f"Start joints (rad): {start_joints.round(3).tolist()}")
+    start_joints_deg = np.rad2deg(start_joints)
+    logger.info(f"Start joints (deg): "
+                f"j1={start_joints_deg[0]:+.1f} j2={start_joints_deg[1]:+.1f} "
+                f"j3={start_joints_deg[2]:+.1f} j4={start_joints_deg[3]:+.1f} "
+                f"j5={start_joints_deg[4]:+.1f} j6={start_joints_deg[5]:+.1f} "
+                f"j7={start_joints_deg[6]:+.1f}")
+    logger.info("Driver joint limits (deg, applied by OpenArm7Follower.send_action):")
+    for name, (lo, hi) in zip(JOINT_NAMES, DRIVER_JOINT_LIMITS_DEG):
+        logger.info(f"  {name:14s} ∈ [{lo:+6.1f}, {hi:+6.1f}]")
     logger.info("Orientation will be locked (sending identity R_delta every step).")
+
+    # Mirror the server's integrator on the client so we can verify that the
+    # measured EE position (from GetArmState = FK of measured joints) actually
+    # tracks the commanded cumulative target. Since dr6d = identity every step,
+    # the server's R_target stays at its startup value, which equals the FK
+    # rotation we just read into start_r6d. We can rebuild the same matrix on
+    # the client side and accumulate position locally.
+    row0 = np.array(start_r6d[:3])
+    row1 = np.array(start_r6d[3:6])
+    row2 = np.cross(row0, row1)
+    R_target = np.stack([row0, row1, row2], axis=0)
+    expected_pos = start_pos.copy().astype(np.float64)
+    # Total cumulative position error stats (max + final-of-each-edge).
+    max_pos_err_mm = 0.0
+    # Starting image-right direction (camera +X in world), captured at step 0,
+    # used to compute roll angle around the optical axis on subsequent samples.
+    _start_image_right: list = []
+    max_roll_deg = 0.0
 
     deltas = build_square_local_deltas(args.half_size, args.steps_per_edge, args.plane)
     total_steps = len(deltas)
@@ -215,27 +305,76 @@ def main():
                 arm_stub.SendCartesianDelta(arm_pb2.CartesianDelta(
                     dx=dx, dy=dy, dz=dz, dr6d=IDENTITY_R6D,
                 ))
+                # Track expected cumulative target client-side. Identical math
+                # to the server's integrator (`_target_pos += R_target @ Δpos`).
+                expected_pos = expected_pos + R_target @ np.array([dx, dy, dz])
 
                 if i % (args.steps_per_edge // 4) == 0:
                     pos, r6d, joints = get_ee_pose(arm_stub)
-                    # Log EE pose + measured joints. The third column of R is the
-                    # camera optical axis in world; if it drifts edge-to-edge,
-                    # orientation is not being held. The wrist joints (indices
-                    # 4, 5, 6 = wrist_yaw, wrist_roll, wrist_pitch) tell us
-                    # whether the arm is yawing the wrist to satisfy position.
-                    R = np.array([
-                        [r6d[0], r6d[3]],
-                        [r6d[1], r6d[4]],
-                        [r6d[2], r6d[5]],
-                    ])
-                    optical = np.cross(R[:, 0], R[:, 1])  # third col = optical axis
+                    pos_err_mm = float(np.linalg.norm(pos - expected_pos) * 1000)
+                    max_pos_err_mm = max(max_pos_err_mm, pos_err_mm)
+                    # `r6d` is the first two ROWS of the 3x3 rotation matrix
+                    # (lerobot's `rotation_matrix_to_6d` slices [..., :2, :]).
+                    # Rebuild rows, recover the third row via cross product,
+                    # then take the THIRD COLUMN — that's the camera optical
+                    # axis (+Z in camera-local) expressed in world coords.
+                    row0 = np.array(r6d[:3])
+                    row1 = np.array(r6d[3:6])
+                    row2 = np.cross(row0, row1)
+                    R = np.stack([row0, row1, row2], axis=0)
+                    image_right = R[:, 0]   # camera +X in world
+                    image_down  = R[:, 1]   # camera +Y in world
+                    optical     = R[:, 2]   # camera +Z (optical axis) in world
+                    # Roll angle around the optical axis: change of image-right
+                    # direction from its starting orientation, projected into
+                    # the plane perpendicular to the (fixed) optical axis.
+                    # Captures camera "roll" that leaves the optical axis
+                    # invariant but rotates the image — what a wrist joint
+                    # aligned with the optical axis produces.
+                    if i == 0 and loop_idx == 0:
+                        # Cache the starting image-right; subsequent samples
+                        # measure the roll relative to it.
+                        _start_image_right.append(image_right.copy())
+                    start_ir = _start_image_right[0]
+                    # signed roll angle (degrees) about the current optical axis
+                    proj = image_right - np.dot(image_right, optical) * optical
+                    proj_start = start_ir - np.dot(start_ir, optical) * optical
+                    proj /= max(np.linalg.norm(proj), 1e-9)
+                    proj_start /= max(np.linalg.norm(proj_start), 1e-9)
+                    cos_a = float(np.clip(np.dot(proj, proj_start), -1, 1))
+                    sign = float(np.sign(np.dot(np.cross(proj_start, proj), optical)))
+                    roll_deg = sign * np.degrees(np.arccos(cos_a))
+                    deg = np.rad2deg(joints)
+                    # Flag any joint within `JOINT_SATURATION_FLAG_DEG` of a
+                    # driver limit. Joint limits below are those enforced by
+                    # `OpenArm7FollowerConfig.RIGHT_DEFAULT_JOINTS_LIMITS`.
+                    flags = [
+                        _saturation_flag(name, val, lo, hi)
+                        for (name, val, (lo, hi)) in zip(
+                            JOINT_NAMES, deg, DRIVER_JOINT_LIMITS_DEG
+                        )
+                    ]
+                    flag_str = " ".join(flags)
+                    gripper_str = ""
+                    if args.log_gripper_frame:
+                        try:
+                            g = _gripper_pos_from_joints(joints)
+                            gripper_str = f" gripper [{g[0]:+.3f}, {g[1]:+.3f}, {g[2]:+.3f}]"
+                        except Exception as e:
+                            gripper_str = f" gripper=<err: {e}>"
+                    max_roll_deg = max(max_roll_deg, abs(roll_deg))
                     logger.info(
                         f"  loop {loop_idx} step {i:>4d}/{total_steps}: "
                         f"EE [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] "
+                        f"expect [{expected_pos[0]:+.3f}, {expected_pos[1]:+.3f}, {expected_pos[2]:+.3f}] "
+                        f"err={pos_err_mm:5.1f}mm{gripper_str}  "
                         f"optical [{optical[0]:+.2f}, {optical[1]:+.2f}, {optical[2]:+.2f}] "
-                        f"wrist_yaw={np.rad2deg(joints[4]):+6.1f}° "
-                        f"wrist_roll={np.rad2deg(joints[5]):+6.1f}° "
-                        f"wrist_pitch={np.rad2deg(joints[6]):+6.1f}°"
+                        f"img_right [{image_right[0]:+.2f}, {image_right[1]:+.2f}, {image_right[2]:+.2f}] "
+                        f"roll={roll_deg:+6.1f}°  "
+                        f"joints (deg): "
+                        f"j1={deg[0]:+6.1f} j2={deg[1]:+6.1f} j3={deg[2]:+6.1f} "
+                        f"j4={deg[3]:+6.1f} j5={deg[4]:+6.1f} j6={deg[5]:+6.1f} "
+                        f"j7={deg[6]:+6.1f}{(' ' + flag_str) if flag_str.strip() else ''}"
                     )
 
                 elapsed = time.perf_counter() - t0
@@ -245,6 +384,22 @@ def main():
             loop_idx += 1
             if args.loops > 0 and loop_idx >= args.loops:
                 logger.info(f"Completed {args.loops} loop(s)")
+                final_err_mm = float(np.linalg.norm(
+                    get_ee_pose(arm_stub)[0] - expected_pos
+                ) * 1000)
+                logger.info(
+                    f"Position-error summary: peak {max_pos_err_mm:.1f} mm, "
+                    f"final {final_err_mm:.1f} mm. "
+                    f"(<2 mm = closed loop is tracking; "
+                    f">5 mm = IK can't reach target or motor not tracking)"
+                )
+                logger.info(
+                    f"Camera-roll summary: peak |roll| = {max_roll_deg:.1f}° "
+                    f"around the optical axis. "
+                    f"(<2° = orientation truly held; "
+                    f">5° = IK is using camera roll as the null-space DOF — "
+                    f"a posture task on the wrist joints would fix this.)"
+                )
                 break
 
     except KeyboardInterrupt:

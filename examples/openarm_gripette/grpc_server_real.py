@@ -364,6 +364,24 @@ def parse_args():
     p.add_argument("--can_port", type=str, default="can0", help="CAN interface name")
     p.add_argument("--side", type=str, default="right", choices=["left", "right"])
     p.add_argument(
+        "--ik_orientation_weight",
+        type=float,
+        default=10.0,
+        help="Placo frame-task orientation weight. Default 10.0 on real (sim "
+        "uses 1.0). 100:1 position-priority leaks rotation into wrist_yaw "
+        "when translating image-right or image-down at the standard home pose "
+        "— observable in cartesian_square as a visible camera yaw on edges "
+        "perpendicular to the optical axis. Bumping to 10 keeps orientation "
+        "held at the cost of <1 mm position error per step. Try 50+ only if "
+        "10 still shows yaw drift; trades more position accuracy.",
+    )
+    p.add_argument(
+        "--ik_position_weight",
+        type=float,
+        default=100.0,
+        help="Placo frame-task position weight. Default 100.0 (same as sim).",
+    )
+    p.add_argument(
         "--max_relative_target",
         type=float,
         default=8.0,
@@ -464,9 +482,17 @@ def main():
 
     arm_iface = ArmInterface(robot, arm_joint_map)
 
-    # ---- Kinematics (same as simulator) ----
-    logger.info("Loading kinematics (placo + URDF from openarm_gripette_model)")
-    kin = Kinematics()
+    # ---- Kinematics (same URDF as simulator, but with stricter orientation
+    #      weight on real to keep the wrist locked through optical-axis
+    #      translation; see --ik_orientation_weight in CLI help) ----
+    logger.info(
+        f"Loading kinematics (placo + URDF from openarm_gripette_model), "
+        f"frame-task weights pos={args.ik_position_weight} orient={args.ik_orientation_weight}"
+    )
+    kin = Kinematics(
+        position_weight=args.ik_position_weight,
+        orientation_weight=args.ik_orientation_weight,
+    )
     logger.info("Kinematics loaded")
 
     # ---- gRPC server ----

@@ -90,6 +90,33 @@ class OpenArm7FollowerConfigBase(OpenArmFollowerConfigBase):
         }
     )
 
+    # Per-joint sign multipliers applied symmetrically to read AND write paths.
+    # Use only when a specific motor's physical rotation direction disagrees
+    # with the URDF axis (and you can't or don't want to fix it in Damiao
+    # firmware via the official OpenArm tool). Default = +1 for every joint
+    # (no flip), preserving identical behavior to upstream.
+    #
+    # Per-robot overrides: each physical OpenArm may have different motor
+    # wiring directions. Set per-robot via the `grpc_server_real.py` CLI flag
+    # `--flip_joint_signs joint_7` (etc.), or by constructing the config
+    # programmatically. Do NOT bake your robot's specific flips into this
+    # default — that breaks portability to other robots / sim.
+    #
+    # Example: if commanded joint_7=+30° physically rotates the wrist
+    # opposite to URDF's +Z axis on YOUR specific arm, pass
+    # `--flip_joint_signs joint_7` to the server.
+    joint_signs: dict[str, float] = field(
+        default_factory=lambda: {
+            "joint_1": +1.0,
+            "joint_2": +1.0,
+            "joint_3": +1.0,
+            "joint_4": +1.0,
+            "joint_5": +1.0,
+            "joint_6": +1.0,
+            "joint_7": +1.0,
+        }
+    )
+
 
 @RobotConfig.register_subclass("openarm7_follower")
 @dataclass
