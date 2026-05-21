@@ -28,6 +28,7 @@ Usage:
 import argparse
 import json
 import logging
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -214,6 +215,32 @@ def parse_args():
         help="State mode: 'none' = gripper only (2D), 'relative' = pose relative to episode start (11D)",
     )
     parser.add_argument(
+        "--output_repo_id",
+        type=str,
+        default=None,
+        help="If set, copy the source dataset to a new local directory "
+             "and convert THAT copy, leaving --repo_id untouched. The "
+             "destination is a sibling of the source cache dir, keyed by "
+             "this repo id (slashes replaced with '--'). Use this when "
+             "you want to preserve the raw dataset (default conversion is "
+             "in-place on the local HF cache).",
+    )
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        default=None,
+        help="Override the destination path for --output_repo_id. By "
+             "default the copy lands next to the source under "
+             "~/.cache/huggingface/lerobot/local-converted/<repo_id>/. "
+             "Ignored if --output_repo_id is not set.",
+    )
+    parser.add_argument(
+        "--overwrite_output",
+        action="store_true",
+        help="If the destination already exists, delete it before copying. "
+             "Off by default to avoid accidental data loss.",
+    )
+    parser.add_argument(
         "--push_to_hub",
         type=str,
         default=None,
@@ -239,7 +266,56 @@ def main():
 
     logger.info(f"Proprioception mode: {args.proprioception} ({state_dim}D state)")
 
-    ds = LeRobotDataset(args.repo_id)
+    # If --output_repo_id is set, copy the source dataset to a new local
+    # directory and operate on the copy. Otherwise the conversion is in-place
+    # on the HF cache (original behavior).
+    if args.output_repo_id:
+        src_ds = LeRobotDataset(args.repo_id)
+        src_root = Path(src_ds.root)
+        if args.output_root:
+            dst_root = Path(args.output_root).expanduser().resolve()
+        else:
+            default_parent = Path.home() / ".cache/huggingface/lerobot/local-converted"
+            dst_root = default_parent / args.output_repo_id.replace("/", "--")
+        if dst_root.exists():
+            if args.overwrite_output:
+                logger.warning(f"Overwriting existing destination: {dst_root}")
+                shutil.rmtree(dst_root)
+            else:
+                raise FileExistsError(
+                    f"Destination already exists: {dst_root}. "
+                    f"Pass --overwrite_output to delete it, or pick a different "
+                    f"--output_repo_id / --output_root."
+                )
+        logger.info(f"Copying source dataset {src_root} → {dst_root} ...")
+        dst_root.parent.mkdir(parents=True, exist_ok=True)
+        # symlinks=False (default): dereference the HF cache symlinks so the
+        # copy is a self-contained snapshot. With symlinks=True the destination
+        # would inherit broken `../../blobs/<hash>` relative links pointing
+        # back at the source cache layout — meta/info.json would appear to
+        # exist but read as missing, and LeRobotDataset would then fall back
+        # to a Hub lookup against a repo id that doesn't exist yet.
+        shutil.copytree(src_root, dst_root)
+        logger.info("Copy complete.")
+        # Sanity-check that the copy is self-contained (catches the broken-
+        # symlink failure mode early, with a clear error rather than a
+        # confusing Hub-lookup 404 from LeRobotDataset's metadata fallback).
+        for required in ("meta/info.json", "meta/stats.json"):
+            p = dst_root / required
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"Copy is incomplete: {p} not found. "
+                    f"This usually means the source cache uses HF symlinks "
+                    f"and the copy was made with symlinks=True. Delete the "
+                    f"destination ({dst_root}) and retry."
+                )
+        work_repo_id = args.output_repo_id
+        work_root: Path | None = dst_root
+        ds = LeRobotDataset(work_repo_id, root=work_root)
+    else:
+        ds = LeRobotDataset(args.repo_id)
+        work_repo_id = args.repo_id
+        work_root = None  # let LeRobotDataset resolve from HF cache by repo_id
     root = Path(ds.root)
     logger.info(f"Dataset root: {root}")
     logger.info(f"Frames: {len(ds)}, Episodes: {ds.meta.total_episodes}")
@@ -326,12 +402,12 @@ def main():
     logger.info("Recomputing stats...")
     from lerobot.datasets.dataset_tools import recompute_stats
 
-    ds_updated = LeRobotDataset(args.repo_id)
+    ds_updated = LeRobotDataset(work_repo_id, root=work_root)
     recompute_stats(ds_updated, skip_image_video=True)
 
     # --- 4. Verify ---
     logger.info("\n=== Verification ===")
-    ds_final = LeRobotDataset(args.repo_id, episodes=[0])
+    ds_final = LeRobotDataset(work_repo_id, root=work_root, episodes=[0])
 
     logger.info(
         f"observation.state: shape={ds_final.meta.features['observation.state']['shape']}, "
@@ -370,13 +446,19 @@ def main():
     if args.push_to_hub:
         target = args.push_to_hub
         logger.info(f"\nPushing to Hub repo: {target} (private={args.hub_private})")
-        ds_push = LeRobotDataset(args.repo_id)
-        if target != args.repo_id:
+        ds_push = LeRobotDataset(work_repo_id, root=work_root)
+        if target != work_repo_id:
             # Retarget — same approach as the standalone push helper.
             ds_push.repo_id = target
             ds_push.meta.repo_id = target
         ds_push.push_to_hub(private=args.hub_private, push_videos=True)
         logger.info(f"Pushed: {target}")
+
+    if args.output_repo_id:
+        logger.info(
+            f"\nConverted copy lives at {root}. "
+            f"Load it with: LeRobotDataset('{work_repo_id}', root='{root}')."
+        )
 
 
 if __name__ == "__main__":
