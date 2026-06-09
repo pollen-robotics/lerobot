@@ -329,6 +329,16 @@ def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
     state = optimizer.state_dict()
     param_groups = state.pop("param_groups")
     flat_state = flatten_dict(state)
+    # safetensors only serializes torch.Tensor values. Some optimizers
+    # (notably bitsandbytes' AdamW8bit) store scalars like `step` as Python
+    # ints rather than 0-dim tensors. Convert any non-tensor scalar to a
+    # 0-dim tensor so save_file accepts them. On load, optimizer.load_state_dict
+    # will broadcast 0-dim tensors back to scalars where appropriate; bnb's
+    # update code handles `state['step'] += 1` whether step is int or tensor.
+    flat_state = {
+        k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
+        for k, v in flat_state.items()
+    }
     save_file(flat_state, save_dir / OPTIMIZER_STATE)
     write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
 
