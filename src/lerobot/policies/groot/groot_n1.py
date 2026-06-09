@@ -177,13 +177,21 @@ N_COLOR_CHANNELS = 3
 @dataclass
 class GR00TN15Config(PretrainedConfig):
     model_type = "gr00t_n1_5"
-    backbone_cfg: dict = field(init=False, metadata={"help": "Backbone configuration."})
+    # Note: `default=None` / `default=0` added to satisfy the dataclass
+    # field-ordering rule under transformers v5, where `PretrainedConfig`
+    # supplies parent fields with defaults — without explicit defaults here,
+    # the `@dataclass` decorator raises
+    # `TypeError: non-default argument 'backbone_cfg' follows default argument`
+    # at import time. `init=False` means these are set in __init__ from
+    # kwargs (see GR00TN15Config.__init__ below), so the explicit None/0
+    # default is only a structural placeholder.
+    backbone_cfg: dict = field(default=None, init=False, metadata={"help": "Backbone configuration."})
 
-    action_head_cfg: dict = field(init=False, metadata={"help": "Action head configuration."})
+    action_head_cfg: dict = field(default=None, init=False, metadata={"help": "Action head configuration."})
 
-    action_horizon: int = field(init=False, metadata={"help": "Action horizon."})
+    action_horizon: int = field(default=0, init=False, metadata={"help": "Action horizon."})
 
-    action_dim: int = field(init=False, metadata={"help": "Action dimension."})
+    action_dim: int = field(default=0, init=False, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
 
     def __init__(self, **kwargs):
