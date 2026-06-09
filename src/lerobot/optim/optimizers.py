@@ -108,6 +108,30 @@ class AdamWConfig(OptimizerConfig):
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
+        # Memory-efficient escape valve for large-model training (e.g. Pi0Fast
+        # on a 32 GB GPU). Setting LEROBOT_USE_8BIT_OPTIMIZER=1 switches to
+        # bitsandbytes' AdamW8bit, which uses block-wise quantization for the
+        # AdamW momentum + variance state. For a 2.3B-parameter model this
+        # drops optimizer state from ~28 GB (fp32) to ~7 GB (8-bit) — usually
+        # the difference between fitting on a 32 GB consumer GPU and OOMing.
+        # Requires `bitsandbytes` to be installed. Loss curves are typically
+        # indistinguishable from full-precision AdamW for VLA fine-tuning.
+        import os
+
+        if os.environ.get("LEROBOT_USE_8BIT_OPTIMIZER") == "1":
+            try:
+                import bitsandbytes as bnb
+            except ImportError as e:
+                raise ImportError(
+                    "LEROBOT_USE_8BIT_OPTIMIZER=1 was set, but `bitsandbytes` is "
+                    "not installed. Run: `uv pip install bitsandbytes`."
+                ) from e
+            import logging
+
+            logging.getLogger(__name__).info(
+                "Using bitsandbytes AdamW8bit (LEROBOT_USE_8BIT_OPTIMIZER=1)."
+            )
+            return bnb.optim.AdamW8bit(params, **kwargs)
         return torch.optim.AdamW(params, **kwargs)
 
 
