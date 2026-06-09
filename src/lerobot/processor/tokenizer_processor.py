@@ -376,9 +376,55 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         elif self.action_tokenizer_name is not None:
             if AutoProcessor is None:
                 raise ImportError("AutoProcessor is not available")
-            self.action_tokenizer = AutoProcessor.from_pretrained(
-                self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
-            )
+            try:
+                self.action_tokenizer = AutoProcessor.from_pretrained(
+                    self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
+                )
+            except ValueError as e:
+                # Workaround for a transformers v5 regression in
+                # AutoProcessor → ProcessorMixin._load_tokenizer_from_pretrained:
+                # for Hub repos whose tokenizer is published as a tokenizer.json-only
+                # artifact (e.g. `physical-intelligence/fast`), the inner load
+                # raises a misleading "Couldn't instantiate the backend tokenizer
+                # / need sentencepiece" ValueError even when both sentencepiece
+                # and protobuf are installed and the tokenizer.json is in the
+                # cache. AutoTokenizer alone loads the same repo correctly.
+                #
+                # The workaround bypasses AutoProcessor entirely: fetch the
+                # repo's custom processor module via huggingface_hub, import it
+                # dynamically (the way trust_remote_code normally would), load
+                # the inner BPE tokenizer through AutoTokenizer (which works),
+                # and construct the custom ProcessorMixin subclass manually.
+                #
+                # See docs/upstream_issues_pi0fast_2026-06-09.md for the bug
+                # reports filed (one transformers, one lerobot). When upstream
+                # fixes the transformers side, this branch becomes a no-op.
+                if "instantiate the backend tokenizer" not in str(e):
+                    raise
+                import importlib.util as _importlib_util
+
+                from huggingface_hub import hf_hub_download
+                from transformers.processing_utils import ProcessorMixin
+
+                _custom_path = hf_hub_download(
+                    self.action_tokenizer_name, "processing_action_tokenizer.py"
+                )
+                _spec = _importlib_util.spec_from_file_location(
+                    "_lerobot_fast_action_tokenizer_workaround", _custom_path
+                )
+                _mod = _importlib_util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _processor_cls = next(
+                    cls
+                    for cls in vars(_mod).values()
+                    if isinstance(cls, type)
+                    and issubclass(cls, ProcessorMixin)
+                    and cls is not ProcessorMixin
+                )
+                _bpe = AutoTokenizer.from_pretrained(
+                    self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
+                )
+                self.action_tokenizer = _processor_cls(bpe_tokenizer=_bpe)
         else:
             raise ValueError(
                 "Either 'action_tokenizer' or 'action_tokenizer_name' must be provided. "
