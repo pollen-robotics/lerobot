@@ -213,3 +213,15 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+
+# Backwards-compatibility aliases: these steps were previously registered as
+# `relative_actions_processor` / `absolute_actions_processor` in earlier
+# LeRobot versions, then `relative_actions_processor` was renamed to
+# `delta_actions_processor`. Published pretrained Pi0/Pi0Fast checkpoints
+# (e.g. `lerobot/pi0fast-base`) still reference the old name in their
+# `policy_preprocessor.json`. Without this alias, loading those checkpoints
+# fails with a registry lookup error. New code should still use the
+# `delta_actions_processor` name; this alias exists for read-compatibility
+# only and does not change behaviour.
+ProcessorStepRegistry._registry["relative_actions_processor"] = RelativeActionsProcessorStep
