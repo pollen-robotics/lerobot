@@ -329,14 +329,24 @@ def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
     state = optimizer.state_dict()
     param_groups = state.pop("param_groups")
     flat_state = flatten_dict(state)
-    # safetensors only serializes torch.Tensor values. Some optimizers
-    # (notably bitsandbytes' AdamW8bit) store scalars like `step` as Python
-    # ints rather than 0-dim tensors. Convert any non-tensor scalar to a
-    # 0-dim tensor so save_file accepts them. On load, optimizer.load_state_dict
-    # will broadcast 0-dim tensors back to scalars where appropriate; bnb's
-    # update code handles `state['step'] += 1` whether step is int or tensor.
+    # safetensors imposes two constraints that vanilla torch.save doesn't:
+    #
+    # (1) Every value must be a torch.Tensor. Some optimizers (notably
+    #     bitsandbytes' AdamW8bit) store scalars like `step` as Python ints
+    #     rather than 0-dim tensors. Convert any non-tensor scalar to a
+    #     0-dim tensor so save_file accepts them. On load, optimizer.load_state_dict
+    #     handles a 0-dim tensor where an int was expected (bnb's update
+    #     does `state['step'] += 1` which works either way).
+    #
+    # (2) No two values may share the same underlying memory. Bitsandbytes'
+    #     AdamW8bit ALSO shares its quantization-table tensors (qmap1, qmap2)
+    #     across all parameter groups — those are constant lookup tables
+    #     generated once at construction. safetensors detects the shared
+    #     data_ptr() and refuses. .clone() on every tensor breaks the
+    #     sharing. Cost: ~1 KB per duplicated qmap, ~1-2 MB total for a 2.3B
+    #     model — negligible vs the ~7 GB optimizer state.
     flat_state = {
-        k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
+        k: (v.clone() if isinstance(v, torch.Tensor) else torch.as_tensor(v))
         for k, v in flat_state.items()
     }
     save_file(flat_state, save_dir / OPTIMIZER_STATE)
