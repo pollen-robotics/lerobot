@@ -25,7 +25,31 @@ import numpy as np
 import torch
 
 from lerobot.policies import make_pre_post_processors
-from lerobot.policies.diffusion import DiffusionPolicy
+import json as _json
+from pathlib import Path as _Path
+
+from lerobot.policies.diffusion import DiffusionPolicy  # noqa: F401 (kept for back-compat)
+from lerobot.policies.factory import get_policy_class
+
+
+def _load_policy_any(checkpoint: str):
+    """Load any LeRobot policy from a checkpoint, dispatching on the `type`
+    field in its config.json (e.g. 'diffusion', 'act', 'pi0_fast'). This
+    replaces the previous hardcoded DiffusionPolicy.from_pretrained so the
+    same eval works for the Diffusion / ACT / Pi0Fast comparison arms.
+
+    Falls back to a local config.json read; for Hub repos the file is fetched.
+    """
+    cfg_path = _Path(checkpoint) / "config.json"
+    if cfg_path.is_file():
+        policy_type = _json.loads(cfg_path.read_text())["type"]
+    else:
+        from huggingface_hub import hf_hub_download
+
+        policy_type = _json.loads(
+            _Path(hf_hub_download(checkpoint, "config.json")).read_text()
+        )["type"]
+    return get_policy_class(policy_type).from_pretrained(checkpoint)
 from lerobot.utils.rotation import (
     rotation_6d_to_rotation_matrix_numpy,
     rotation_matrix_to_rotation_6d_numpy,
@@ -45,6 +69,15 @@ def parse_args():
     p.add_argument("--fps", type=float, default=10.0, help="Control loop frequency")
     p.add_argument("--success_check_freq", type=int, default=10, help="Check success every N steps")
     p.add_argument("--debug", action="store_true", help="Show camera feed during evaluation")
+    p.add_argument(
+        "--task",
+        type=str,
+        default="grasp and lift cube",
+        help="Language task string for VLA policies (Pi0/Pi0Fast/Pi0.5). Ignored "
+        "by Diffusion/ACT. Should match (cleaned) the task used at training time "
+        "— the dataset's task was 'grasp_and_lift_cube', which the Pi0Fast "
+        "processor cleans to 'grasp and lift cube'.",
+    )
     return p.parse_args()
 
 
@@ -121,6 +154,7 @@ def run_episode(
     use_relative_proprio,
     start_pos,
     start_rot,
+    task,
 ) -> dict:
     """Run a single evaluation episode. Returns dict with stats."""
     dt = 1.0 / fps
@@ -147,6 +181,11 @@ def run_episode(
         batch = {
             "observation.state": state_tensor.unsqueeze(0).to(device),
             "observation.images.cam0": image_tensor.unsqueeze(0).to(device),
+            # VLA policies (Pi0/Pi0Fast/Pi0.5) require a language task string;
+            # their preprocessor tokenizes it into the prompt. Classic policies
+            # (Diffusion/ACT) ignore it — exactly as during training, where the
+            # dataset always carried a `task` field. Harmless to always include.
+            "task": task,
         }
 
         # --- Inference ---
@@ -223,9 +262,10 @@ def main():
     logging.basicConfig(level=logging.INFO)
     device = torch.device(args.device)
 
-    # ---- Load policy ----
+    # ---- Load policy (any type: diffusion / act / pi0_fast / ...) ----
     logger.info(f"Loading policy from {args.checkpoint}")
-    policy = DiffusionPolicy.from_pretrained(args.checkpoint)
+    policy = _load_policy_any(args.checkpoint)
+    logger.info(f"Loaded policy type: {policy.config.type}")
     policy.to(device)
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
@@ -303,6 +343,7 @@ def main():
             use_relative_proprio=use_relative_proprio,
             start_pos=start_pos,
             start_rot=start_rot,
+            task=args.task,
         )
         results.append(result)
 

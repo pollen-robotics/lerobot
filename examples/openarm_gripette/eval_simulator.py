@@ -26,7 +26,26 @@ import numpy as np
 import torch
 
 from lerobot.policies import make_pre_post_processors
-from lerobot.policies.diffusion import DiffusionPolicy
+import json as _json
+from pathlib import Path as _Path
+
+from lerobot.policies.diffusion import DiffusionPolicy  # noqa: F401 (back-compat)
+from lerobot.policies.factory import get_policy_class
+
+
+def _load_policy_any(checkpoint: str):
+    """Load any LeRobot policy from a checkpoint, dispatching on config.json's
+    `type` (diffusion / act / pi0_fast / ...). Replaces the hardcoded
+    DiffusionPolicy.from_pretrained so this eval client works across the
+    Diffusion / ACT / Pi0Fast comparison arms."""
+    cfg = _Path(checkpoint) / "config.json"
+    if cfg.is_file():
+        ptype = _json.loads(cfg.read_text())["type"]
+    else:
+        from huggingface_hub import hf_hub_download
+
+        ptype = _json.loads(_Path(hf_hub_download(checkpoint, "config.json")).read_text())["type"]
+    return get_policy_class(ptype).from_pretrained(checkpoint)
 from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.rotation import (
@@ -285,6 +304,14 @@ def debug_show_image(image_rgb: np.ndarray, step: int):
 def parse_args():
     p = argparse.ArgumentParser(description="Run Gripette policy on simulator")
     p.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint")
+    p.add_argument(
+        "--task",
+        type=str,
+        default="grasp and lift cube",
+        help="Language task string for VLA policies (Pi0/Pi0Fast/Pi0.5). Ignored "
+        "by Diffusion/ACT. Match the cleaned training task ('grasp_and_lift_cube' "
+        "→ 'grasp and lift cube').",
+    )
     p.add_argument("--arm_addr", type=str, default="localhost:50052", help="ArmService gRPC address")
     p.add_argument("--gripper_addr", type=str, default="localhost:50051", help="GripperService gRPC address")
     p.add_argument("--device", type=str, default="cuda", help="Compute device")
@@ -388,9 +415,10 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
     device = torch.device(args.device)
 
-    # ---- Load policy and processors ----
+    # ---- Load policy and processors (any type: diffusion / act / pi0_fast) ----
     logger.info(f"Loading policy from {args.checkpoint}")
-    policy = DiffusionPolicy.from_pretrained(args.checkpoint)
+    policy = _load_policy_any(args.checkpoint)
+    logger.info(f"Loaded policy type: {policy.config.type}")
     policy.to(device)
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
@@ -524,6 +552,9 @@ def main():
             batch = {
                 "observation.state": state_tensor.unsqueeze(0).to(device),
                 "observation.images.cam0": image_tensor.unsqueeze(0).to(device),
+                # Language task for VLA policies (Pi0/Pi0Fast/Pi0.5); ignored by
+                # Diffusion/ACT. Mirrors training, where the dataset carried `task`.
+                "task": args.task,
             }
 
             # --- 3. Preprocess -> Policy -> Postprocess ---
