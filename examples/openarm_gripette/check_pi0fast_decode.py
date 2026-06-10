@@ -41,6 +41,13 @@ def parse_args():
     p.add_argument("--checkpoint", required=True, help="Local dir or Hub repo id")
     p.add_argument("--dataset", required=True, help="Dataset to sample a held-out frame from")
     p.add_argument("--device", default="cuda", help="cuda / cuda:N / cpu")
+    p.add_argument(
+        "--dtype",
+        default="float32",
+        choices=["float32", "bfloat16"],
+        help="float32 (default; correct for ACT/Diffusion) or bfloat16 "
+        "(use to fit the 2.3B Pi0Fast on a small GPU).",
+    )
     p.add_argument("--frames", type=int, nargs="+", default=[0, 80, 160], help="Frame indices to test")
     p.add_argument("--task", default="grasp and lift cube", help="Task string for VLA conditioning")
     return p.parse_args()
@@ -58,7 +65,7 @@ def _policy_type(ckpt: str) -> str:
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
     policy = get_policy_class(_policy_type(args.checkpoint)).from_pretrained(args.checkpoint)
     policy = policy.to(device=device, dtype=dtype).eval()
