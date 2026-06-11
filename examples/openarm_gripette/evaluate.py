@@ -70,6 +70,14 @@ def parse_args():
     p.add_argument("--success_check_freq", type=int, default=10, help="Check success every N steps")
     p.add_argument("--debug", action="store_true", help="Show camera feed during evaluation")
     p.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=None,
+        help="Override the checkpoint's n_action_steps at inference (re-planning "
+        "cadence). 1 = re-infer every step (tightest closed loop). Lower values "
+        "help policies that drift open-loop (notably ACT). None = use checkpoint value.",
+    )
+    p.add_argument(
         "--task",
         type=str,
         default="grasp and lift cube",
@@ -107,11 +115,13 @@ def compute_relative_state(arm_state, gripper_joints, start_pos, start_rot):
     """Compute 11D relative state: [pos_rel(3), rot_rel_6d(6), gripper(2)]."""
     pos = np.array([arm_state.x, arm_state.y, arm_state.z], dtype=np.float32)
     rot_6d = np.array(list(arm_state.r6d), dtype=np.float32)
-
-    rel_pos = pos - start_pos
-
     r_current = rotation_6d_to_rotation_matrix_numpy(rot_6d.reshape(1, 6))[0]
-    r_relative = r_current @ start_rot.T
+
+    # Pose relative to start, in the START camera frame (gripper-egocentric /
+    # frame-independent — MUST match convert_dataset.py):
+    #   rel_pos = R_start^T @ (pos - start_pos);  R_rel = R_start^T @ R_current
+    rel_pos = start_rot.T @ (pos - start_pos)
+    r_relative = start_rot.T @ r_current
     rel_rot_6d = rotation_matrix_to_rotation_6d_numpy(r_relative.reshape(1, 3, 3))[0]
 
     return np.concatenate([rel_pos, rel_rot_6d, gripper_joints])
@@ -266,6 +276,17 @@ def main():
     logger.info(f"Loading policy from {args.checkpoint}")
     policy = _load_policy_any(args.checkpoint)
     logger.info(f"Loaded policy type: {policy.config.type}")
+    # Optional re-planning-cadence override. Smaller n_action_steps re-infers
+    # more often (tighter closed loop), which matters a lot for policies that
+    # drift off-distribution during open-loop chunk execution — ACT in
+    # particular is designed for very frequent re-planning / temporal
+    # ensembling, and executing long chunks (its trained default of 8+) can
+    # cause it to wander off the grasp manifold and never trigger the close.
+    if args.n_action_steps is not None:
+        logger.info(
+            f"Overriding n_action_steps: {policy.config.n_action_steps} -> {args.n_action_steps}"
+        )
+        policy.config.n_action_steps = args.n_action_steps
     policy.to(device)
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)

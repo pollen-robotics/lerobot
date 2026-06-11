@@ -12,8 +12,11 @@ Transforms the dataset:
 
      --proprioception relative:
        observation.state = [dx_start, dy_start, dz_start, r6d_rel_0..5, proximal, distal]  (11D)
-       Includes position and rotation relative to episode start (UMI approach).
-       Frame-independent proprioception — the model knows how far it moved/rotated.
+       Pose relative to episode start, expressed in the START camera frame
+       (R_start^T @ (pos - pos_start), R_start^T @ R) — same gripper-egocentric
+       convention as the action deltas, so it's frame-independent (the arbitrary
+       per-session world orientation cancels). The model knows how far it
+       moved/rotated from the episode start, independent of the world frame.
 
 Usage:
   # Gripper-only state (2D):
@@ -154,11 +157,25 @@ def compute_delta_actions(poses_11d: np.ndarray, episode_indices: np.ndarray) ->
 
 
 def compute_relative_to_start_state(poses_11d: np.ndarray, episode_indices: np.ndarray) -> np.ndarray:
-    """Compute position and rotation relative to episode start.
+    """Compute pose relative to episode start, in the START camera frame.
 
-    For each frame, computes:
-      - Position: pos[t] - pos[episode_start]
-      - Rotation: R[t] @ R[episode_start]^{-1}, encoded as 6D
+    This is the proprioception counterpart of `compute_delta_actions`, and it
+    MUST follow the exact same gripper-egocentric convention, otherwise the
+    arbitrary per-session world frame leaks into the state.
+
+    The recorded poses are camera-site SE(3) in a world frame whose horizontal
+    orientation is arbitrary per session (gravity-aligned Z, but X/Y depend on
+    the SLAM origin). A bare displacement `pos[t] - pos_start` is expressed in
+    those world axes, so it rotates with the session — NOT frame-independent.
+    Expressing it in the start camera frame makes the world rotation cancel:
+
+        rel_pos[t] = R_start^T @ (pos[t] - pos_start)
+        R_rel[t]   = R_start^T @ R[t]          # current rotation seen from start
+        rel_r6d[t] = rotation_matrix_to_6d(R_rel[t])
+
+    (Proof of invariance: under any world rotation R_w, pos->R_w·pos and
+    R->R_w·R, so R_start^T·(pos[t]-pos_start) -> (R_w·R_start)^T·R_w·(...) =
+    R_start^T·(...), and likewise for R_rel. The world frame drops out.)
 
     Args:
         poses_11d: (N, 11) absolute poses [x, y, z, r6d_0..5, proximal, distal]
@@ -180,17 +197,13 @@ def compute_relative_to_start_state(poses_11d: np.ndarray, episode_indices: np.n
         ep = episode_indices[i]
         start_i = ep_start_idx[ep]
 
-        # Position relative to episode start
-        relative_state[i, :3] = poses_11d[i, :3] - poses_11d[start_i, :3]
+        r_current = rotation_6d_to_rotation_matrix_numpy(poses_11d[i, 3:9].reshape(1, 6))[0]
+        r_start = rotation_6d_to_rotation_matrix_numpy(poses_11d[start_i, 3:9].reshape(1, 6))[0]
 
-        # Rotation relative to episode start: R_rel = R_current @ R_start^{-1}
-        r6d_current = poses_11d[i, 3:9]
-        r6d_start = poses_11d[start_i, 3:9]
-
-        r_current = rotation_6d_to_rotation_matrix_numpy(r6d_current.reshape(1, 6))[0]
-        r_start = rotation_6d_to_rotation_matrix_numpy(r6d_start.reshape(1, 6))[0]
-        r_relative = r_current @ r_start.T  # R_current @ R_start^{-1}
-
+        # Pose relative to start, expressed in the START camera frame
+        # (gripper-egocentric / frame-independent — see docstring).
+        relative_state[i, :3] = r_start.T @ (poses_11d[i, :3] - poses_11d[start_i, :3])
+        r_relative = r_start.T @ r_current
         relative_state[i, 3:9] = rotation_matrix_to_rotation_6d_numpy(r_relative.reshape(1, 3, 3))[0]
 
     # Gripper: absolute values

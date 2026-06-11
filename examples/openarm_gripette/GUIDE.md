@@ -20,7 +20,11 @@ trained policy is deployed**.
 > **One non-negotiable convention across the whole pipeline.** All position
 > and rotation deltas — in the dataset, in the policy output, and on the wire
 > via `SendCartesianDelta` — are expressed in the **camera's local frame at
-> time t**, not the world frame. See the "Frame Convention" section in
+> time t**, not the world frame. The **same gripper-egocentric rule governs the
+> `--proprioception relative` observation state**: pose relative to the episode
+> start, expressed in the **start camera frame** (`R_start^T @ (pos - pos_start)`,
+> `R_start^T @ R`), never in world axes — and the dataset builder and every
+> eval/deploy consumer must agree on it. See the "Frame Convention" section in
 > [`README.md`](README.md) for the exact math and for the failure signature
 > when this gets violated. The smoke test that catches a broken pipeline in
 > one minute is `cartesian_square.py` (the gRPC-client copy in this

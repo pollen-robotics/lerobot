@@ -136,13 +136,14 @@ def compute_relative_state(
     """
     pos = np.array([arm_state.x, arm_state.y, arm_state.z], dtype=np.float32)
     rot_6d = np.array(list(arm_state.r6d), dtype=np.float32)
-
-    # Position relative to start
-    rel_pos = pos - start_pos
-
-    # Rotation relative to start: R_rel = R_current @ R_start^{-1}
     r_current = rotation_6d_to_rotation_matrix_numpy(rot_6d.reshape(1, 6))[0]
-    r_relative = r_current @ start_rot_matrix.T
+
+    # Pose relative to start, expressed in the START camera frame
+    # (gripper-egocentric / frame-independent — MUST match convert_dataset.py
+    # compute_relative_to_start_state, else train/deploy mismatch):
+    #   rel_pos = R_start^T @ (pos - start_pos);  R_rel = R_start^T @ R_current
+    rel_pos = start_rot_matrix.T @ (pos - start_pos)
+    r_relative = start_rot_matrix.T @ r_current
     rel_rot_6d = rotation_matrix_to_rotation_6d_numpy(r_relative.reshape(1, 3, 3))[0]
 
     return np.concatenate([rel_pos, rel_rot_6d, gripper_joints])

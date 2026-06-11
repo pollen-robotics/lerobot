@@ -49,6 +49,9 @@ def parse_args():
         "(use to fit the 2.3B Pi0Fast on a small GPU).",
     )
     p.add_argument("--frames", type=int, nargs="+", default=[0, 80, 160], help="Frame indices to test")
+    p.add_argument("--no_kv_cache", action="store_true",
+                   help="Pi0Fast diagnostic: force the non-KV-cache decode path "
+                        "(isolates a transformers-v5 KV-cache generation bug).")
     p.add_argument("--task", default="grasp and lift cube", help="Task string for VLA conditioning")
     return p.parse_args()
 
@@ -68,6 +71,13 @@ def main():
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
     policy = get_policy_class(_policy_type(args.checkpoint)).from_pretrained(args.checkpoint)
+    if args.no_kv_cache and hasattr(policy.config, "use_kv_cache"):
+        # Diagnostic: force the non-KV-cache autoregressive decode path.
+        # The KV-cache path is the most transformers-v5-fragile (attention
+        # masking + cache semantics changed in v5); if generation is
+        # degenerate only with the cache, this isolates it.
+        policy.config.use_kv_cache = False
+        print("use_kv_cache forced to False")
     policy = policy.to(device=device, dtype=dtype).eval()
     pre, post = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
 

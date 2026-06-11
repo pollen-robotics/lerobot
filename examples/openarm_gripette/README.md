@@ -95,6 +95,37 @@ sends the real arm "the wrong way". Camera-local deltas are session-invariant:
 they describe motion *relative to what the camera sees*, which is consistent
 across sessions by construction.
 
+#### The same convention applies to relative proprioception
+
+The egocentric rule is **not just for actions** — it governs the
+`--proprioception relative` observation state too. The relative-to-start state
+is the proprioception counterpart of the action deltas, so it uses the
+**identical** convention: pose expressed **in the start camera frame**, never
+in world axes.
+
+```python
+# observation.state for --proprioception relative, per frame t:
+rel_pos       = R[start].T @ (pos[t] - pos[start])   # displacement, in START frame
+R_rel         = R[start].T @ R[t]                    # current rotation, seen from START
+state[:3]     = rel_pos
+state[3:9]    = rotation_matrix_to_rotation_6d_numpy(R_rel)
+state[9:]     = gripper_joints[t]                    # gripper is absolute
+```
+
+A bare `pos[t] - pos[start]` (world axes) or `R[t] @ R[start].T` (world-frame
+relative rotation) is **wrong** — it lets the arbitrary per-session world
+orientation leak into the state, exactly the failure the action convention
+exists to prevent. Left-multiplying by `R[start].T` cancels any world rotation
+`R_w` (since `pos -> R_w·pos` and `R -> R_w·R`), making the state
+session-invariant. This must hold in **both** the dataset builder
+(`convert_dataset.py: compute_relative_to_start_state`) and **every** eval/deploy
+consumer (`compute_relative_state` in `evaluate.py`, `eval_simulator.py`,
+`eval_simulator_act.py`) — if the training-side and deploy-side conventions
+disagree, the model sees a different state distribution at deployment than it
+trained on. (Note: relative-to-start is the *only* frame-independent state that
+carries "how far have I moved / have I arrived" information in this egocentric
+pipeline — instantaneous egocentric quantities carry none.)
+
 **Failure signature** if this convention is violated anywhere in the chain:
 the arm moves in a consistent but visibly wrong direction on real hardware
 while passing sim eval at the same metrics. Use `cartesian_square.py` (the
