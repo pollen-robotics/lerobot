@@ -213,6 +213,12 @@ def parse_args():
         "--val_ratio", type=float, default=0.1, help="Fraction of episodes used for validation"
     )
     parser.add_argument(
+        "--exclude_episodes", type=int, nargs="+", default=None,
+        help="Episode indices to drop before the train/val split (e.g. the IK-flip "
+             "episodes from convert_to_jointspace.py). Pass the SAME list as the ACT "
+             "runs to keep the Diffusion-vs-ACT comparison on one episode set.",
+    )
+    parser.add_argument(
         "--wandb_project", type=str, default=None, help="Wandb project name (None = disabled)"
     )
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name")
@@ -437,6 +443,13 @@ def main():
 
     # ---- Train/val split by episodes ----
     all_episodes = sorted(dataset_metadata.episodes["episode_index"])
+    if args.exclude_episodes:
+        # Drop flagged episodes (e.g. the IK-flip episodes from
+        # convert_to_jointspace.py). Pass the SAME list as the ACT runs so the
+        # Diffusion-vs-ACT comparison is on an identical episode set.
+        excl = set(args.exclude_episodes)
+        all_episodes = [e for e in all_episodes if e not in excl]
+        print(f"  Excluding {len(excl)} episodes; {len(all_episodes)} remain.")
     num_val = max(1, int(len(all_episodes) * args.val_ratio))
     # Use last episodes as validation (deterministic split, no randomness)
     val_episodes = all_episodes[-num_val:]
