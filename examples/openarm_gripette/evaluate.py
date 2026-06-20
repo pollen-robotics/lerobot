@@ -51,9 +51,36 @@ def _load_policy_any(checkpoint: str):
         )["type"]
     return get_policy_class(policy_type).from_pretrained(checkpoint)
 from lerobot.utils.rotation import (
+    Rotation,
     rotation_6d_to_rotation_matrix_numpy,
     rotation_matrix_to_rotation_6d_numpy,
 )
+
+
+def clamp_delta(delta_pos, delta_rot_6d, clamp_pos_m, clamp_rot_rad):
+    """Clip a Cartesian-delta action's magnitude (safety test for outlier samples).
+
+    Diffusion samples from the learned action distribution; on the wide v9
+    distribution it occasionally draws an outlier delta that drives the
+    integrator into a near-singular pose ("explosion"). Clamping the per-step
+    position-delta norm and rotation-delta angle caps those outliers. Returns
+    (delta_pos, delta_rot_6d, was_clamped).
+    """
+    was = False
+    if clamp_pos_m is not None:
+        n = float(np.linalg.norm(delta_pos))
+        if n > clamp_pos_m:
+            delta_pos = delta_pos * (clamp_pos_m / n)
+            was = True
+    if clamp_rot_rad is not None:
+        R = rotation_6d_to_rotation_matrix_numpy(delta_rot_6d.reshape(1, 6))[0]
+        rotvec = Rotation.from_matrix(R).as_rotvec()
+        ang = float(np.linalg.norm(rotvec))
+        if ang > clamp_rot_rad:
+            R = Rotation.from_rotvec(rotvec * (clamp_rot_rad / ang)).as_matrix()
+            delta_rot_6d = rotation_matrix_to_rotation_6d_numpy(R.reshape(1, 3, 3))[0]
+            was = True
+    return delta_pos, delta_rot_6d, was
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +94,15 @@ def parse_args():
     p.add_argument("--num_episodes", type=int, default=20, help="Number of evaluation episodes")
     p.add_argument("--max_steps", type=int, default=300, help="Max steps per episode")
     p.add_argument("--fps", type=float, default=10.0, help="Control loop frequency")
+    p.add_argument("--clamp_pos_mm", type=float, default=None,
+                   help="Safety test: clip per-step Cartesian position-delta norm to this (mm). "
+                        "Caps outlier samples (e.g. Diffusion 'explosions'). Cartesian only.")
+    p.add_argument("--clamp_rot_deg", type=float, default=None,
+                   help="Safety test: clip per-step rotation-delta angle to this (deg). Cartesian only.")
     p.add_argument("--success_check_freq", type=int, default=10, help="Check success every N steps")
     p.add_argument("--debug", action="store_true", help="Show camera feed during evaluation")
+    p.add_argument("--log_gripper", action="store_true",
+                   help="Print the gripper command (proximal/distal) sent each step, vs the observed gripper state")
     p.add_argument(
         "--n_action_steps",
         type=int,
@@ -135,11 +169,20 @@ def build_observation(
     use_relative_proprio,
     start_pos,
     start_rot,
+    joint_mode=False,
 ):
     """Build the full observation (camera image + state) for one step."""
     camera_image, gripper_joints = get_camera_frame(gripper_stub, gripper_pb2)
 
-    if use_relative_proprio:
+    if joint_mode:
+        # Joint-space state = [arm_q(7), proximal, distal], matching
+        # convert_to_jointspace.py. arm_q from GetArmState; gripper from the
+        # gripper service (same 2D as the Cartesian path).
+        arm_state = arm_stub.GetArmState(arm_pb2.GetArmStateRequest())
+        state = np.concatenate(
+            [np.array(arm_state.joint_positions, dtype=np.float32), gripper_joints]
+        )
+    elif use_relative_proprio:
         arm_state = arm_stub.GetArmState(arm_pb2.GetArmStateRequest())
         state = compute_relative_state(arm_state, gripper_joints, start_pos, start_rot)
     else:
@@ -165,8 +208,13 @@ def run_episode(
     start_pos,
     start_rot,
     task,
+    joint_mode=False,
+    clamp_pos_m=None,
+    clamp_rot_rad=None,
+    log_gripper=False,
 ) -> dict:
     """Run a single evaluation episode. Returns dict with stats."""
+    n_clamped = 0
     dt = 1.0 / fps
     episode_start = time.perf_counter()
 
@@ -182,6 +230,7 @@ def run_episode(
             use_relative_proprio,
             start_pos,
             start_rot,
+            joint_mode=joint_mode,
         )
 
         state_tensor = torch.from_numpy(state).float()
@@ -205,19 +254,32 @@ def run_episode(
         action = postprocessor(action)
 
         action_np = action.squeeze(0).cpu().numpy()
-        delta_pos = action_np[:3]
-        delta_rot_6d = action_np[3:9]
-        gripper_goal = action_np[9:]
 
         # --- Send commands ---
-        arm_stub.SendCartesianDelta(
-            arm_pb2.CartesianDelta(
-                dx=float(delta_pos[0]),
-                dy=float(delta_pos[1]),
-                dz=float(delta_pos[2]),
-                dr6d=delta_rot_6d.tolist(),
+        if joint_mode:
+            # 9D joint action: [arm_q(7), proximal, distal]. Arm joints go
+            # straight to the arm (no integrator/IK); gripper via the gripper
+            # service exactly as in the Cartesian path.
+            arm_joints = action_np[:7]
+            gripper_goal = action_np[7:9]
+            arm_stub.SendJointCommand(arm_pb2.JointCommand(joint_positions=arm_joints.tolist()))
+            delta_pos = None
+        else:
+            delta_pos = action_np[:3]
+            delta_rot_6d = action_np[3:9]
+            gripper_goal = action_np[9:]
+            if clamp_pos_m is not None or clamp_rot_rad is not None:
+                delta_pos, delta_rot_6d, was = clamp_delta(
+                    delta_pos, delta_rot_6d, clamp_pos_m, clamp_rot_rad)
+                n_clamped += int(was)
+            arm_stub.SendCartesianDelta(
+                arm_pb2.CartesianDelta(
+                    dx=float(delta_pos[0]),
+                    dy=float(delta_pos[1]),
+                    dz=float(delta_pos[2]),
+                    dr6d=delta_rot_6d.tolist(),
+                )
             )
-        )
         gripper_stub.SendMotorCommand(
             gripper_pb2.MotorCommand(
                 motor1_goal=float(gripper_goal[0]),
@@ -225,13 +287,26 @@ def run_episode(
             )
         )
 
+        if log_gripper:
+            # state[-2:] is always the observed gripper (2D-only, relative, and
+            # joint-space states all end with [proximal, distal]).
+            obs_g = state[-2:]
+            cmd_dist = gripper_goal[1] if len(gripper_goal) > 1 else 0.0
+            obs_dist = obs_g[1] if len(obs_g) > 1 else 0.0
+            print(
+                f"step {step:3d} | gripper cmd: prox={gripper_goal[0]:+.4f} dist={cmd_dist:+.4f}"
+                f" | obs: prox={obs_g[0]:+.4f} dist={obs_dist:+.4f}",
+                flush=True,
+            )
+
         # --- Debug display ---
         if debug:
             img_display = camera_image.copy()
-            delta_mm = np.linalg.norm(delta_pos) * 1000
+            label = (f"Step {step} | joint cmd" if joint_mode
+                     else f"Step {step} | delta {np.linalg.norm(delta_pos) * 1000:.1f}mm")
             cv2.putText(
                 img_display,
-                f"Step {step} | delta {delta_mm:.1f}mm",
+                label,
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -250,6 +325,7 @@ def run_episode(
                     "steps": step + 1,
                     "displacement_mm": status.cube_displacement * 1000,
                     "duration_s": time.perf_counter() - episode_start,
+                    "n_clamped": n_clamped,
                 }
 
         # --- Timing ---
@@ -264,6 +340,7 @@ def run_episode(
         "steps": max_steps,
         "displacement_mm": status.cube_displacement * 1000,
         "duration_s": time.perf_counter() - episode_start,
+        "n_clamped": n_clamped,
     }
 
 
@@ -291,12 +368,14 @@ def main():
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
 
-    # Auto-detect state mode
+    # Auto-detect state/action mode from the policy's feature shapes.
     state_dim = policy.config.robot_state_feature.shape[0]
-    use_relative_proprio = state_dim > 2
+    action_dim = policy.config.action_feature.shape[0]
+    joint_mode = action_dim == 9  # 9D = [arm_q(7), prox, dist]; 11D = Cartesian deltas
+    use_relative_proprio = (state_dim > 2) and not joint_mode
     logger.info(
-        f"Policy: state_dim={state_dim} ({'relative proprio' if use_relative_proprio else 'gripper only'}), "
-        f"action_dim={policy.config.action_feature.shape[0]}, "
+        f"Policy: action_space={'joint' if joint_mode else 'cartesian'}, "
+        f"state_dim={state_dim}, action_dim={action_dim}, "
         f"n_action_steps={policy.config.n_action_steps}"
     )
 
@@ -361,10 +440,14 @@ def main():
             fps=args.fps,
             success_check_freq=args.success_check_freq,
             debug=args.debug,
+            log_gripper=args.log_gripper,
             use_relative_proprio=use_relative_proprio,
             start_pos=start_pos,
             start_rot=start_rot,
             task=args.task,
+            joint_mode=joint_mode,
+            clamp_pos_m=(args.clamp_pos_mm / 1000.0) if args.clamp_pos_mm else None,
+            clamp_rot_rad=(np.deg2rad(args.clamp_rot_deg)) if args.clamp_rot_deg else None,
         )
         results.append(result)
 
@@ -394,6 +477,10 @@ def main():
     print(f"  Avg steps (all):  {avg_steps:.0f}")
     if success_results:
         print(f"  Avg steps (success): {avg_success_steps:.0f}")
+    if args.clamp_pos_mm or args.clamp_rot_deg:
+        total_clamped = sum(r.get("n_clamped", 0) for r in results)
+        print(f"  Action clamp:     pos<={args.clamp_pos_mm}mm rot<={args.clamp_rot_deg}deg "
+              f"({total_clamped} steps clamped across {num_total} eps)")
     print(f"{'=' * 60}")
 
     if args.debug:

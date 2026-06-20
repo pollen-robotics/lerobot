@@ -192,6 +192,16 @@ def parse_args():
         help="LeRobot dataset repo ID",
     )
     parser.add_argument(
+        "--dataset_root",
+        type=str,
+        default=None,
+        help="Local directory holding the dataset (mirrors upstream's "
+             "--dataset.root). Use this to read a local-converted dataset that "
+             "was never pushed to the Hub, e.g. "
+             "~/.cache/huggingface/lerobot/local-converted/<repo--id>. "
+             "When set, prepend HF_HUB_OFFLINE=1 to skip the Hub round-trip.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="outputs/gripette/diffusion",
@@ -319,7 +329,7 @@ def main():
     # ---- Dataset metadata ----
     # Load metadata without downloading the full dataset. This gives us the feature
     # definitions and statistics needed to configure the policy.
-    dataset_metadata = LeRobotDatasetMetadata(args.dataset_repo_id)
+    dataset_metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
     features = dataset_to_policy_features(dataset_metadata.features)
 
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
@@ -456,10 +466,12 @@ def main():
     train_episodes = all_episodes[:-num_val]
 
     train_dataset = LeRobotDataset(
-        args.dataset_repo_id, delta_timestamps=delta_timestamps, episodes=train_episodes
+        args.dataset_repo_id, root=args.dataset_root,
+        delta_timestamps=delta_timestamps, episodes=train_episodes
     )
     val_dataset = LeRobotDataset(
-        args.dataset_repo_id, delta_timestamps=delta_timestamps, episodes=val_episodes
+        args.dataset_repo_id, root=args.dataset_root,
+        delta_timestamps=delta_timestamps, episodes=val_episodes
     )
 
     print(f"  Train episodes:   {len(train_episodes)} ({len(train_dataset)} frames)")
