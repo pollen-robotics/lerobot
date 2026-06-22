@@ -256,12 +256,12 @@ def parse_args():
         help="Enable color jitter augmentation during training (UMI values)",
     )
     parser.add_argument(
-        "--random_crop",
+        "--no_random_crop",
         action="store_true",
-        help="Enable random-crop augmentation (UMI: random 95%% crop of the 236px "
-             "resize). Default OFF -> center crop in both train and eval (same "
-             "224x224 input). The certified recipe used random crop; pass this "
-             "flag to reproduce it.",
+        help="DISABLE random-crop augmentation (ablation only). Default: random "
+             "crop ON (UMI 95%% random crop of the 236px resize) — the certified "
+             "recipe. Eval always uses a center crop regardless; this flag makes "
+             "training use center crop too.",
     )
     parser.add_argument(
         "--state_noise_std",
@@ -379,7 +379,7 @@ def main():
         vision_backbone="resnet18",
         resize_shape=(236, 236),  # slightly larger so 95% crop = 224x224
         crop_ratio=0.95,
-        crop_is_random=args.random_crop,  # default False (flag off); pass --random_crop to enable
+        crop_is_random=not args.no_random_crop,  # default True (UMI); pass --no_random_crop to disable
         pretrained_backbone_weights=None,
         use_group_norm=True,
         spatial_softmax_num_keypoints=32,
